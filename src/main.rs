@@ -25,7 +25,7 @@ const TOP_ARGS: [&str; 8] = [
     "-stats",
     "pid,command,cpu,mem,power",
 ];
-const REFRESH_EVERY: Duration = Duration::from_secs(1);
+const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const HISTORY_LIMIT: usize = 90;
 
