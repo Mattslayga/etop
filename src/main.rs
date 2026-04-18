@@ -23,7 +23,7 @@ const TOP_ARGS: [&str; 8] = [
     "-o",
     "power",
     "-stats",
-    "pid,command,cpu,mem,power",
+    "pid,command,power",
 ];
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
@@ -43,36 +43,14 @@ struct ProcRow {
     pid: i32,
     process: String,
     process_lc: String,
-    cpu: String,
-    mem: String,
     power: String,
     power_num: f64,
-    cpu_num: f64,
-    mem_num: f64,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Snapshot {
     rows: Vec<ProcRow>,
     total_power: f64,
-    total_cpu: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Power,
-    Cpu,
-    Mem,
-}
-
-impl SortKey {
-    fn as_str(self) -> &'static str {
-        match self {
-            SortKey::Power => "power",
-            SortKey::Cpu => "cpu",
-            SortKey::Mem => "mem",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -93,13 +71,11 @@ struct App {
     loading: bool,
     paused: bool,
     show_details: bool,
-    sort: SortKey,
     selected: usize,
     scroll: usize,
     filter_query: String,
     filter_input: Option<String>,
     power_history: Vec<f64>,
-    cpu_history: Vec<f64>,
     visible_indices: Vec<usize>,
     visible_dirty: bool,
 }
@@ -112,13 +88,11 @@ impl App {
             loading: true,
             paused: false,
             show_details: false,
-            sort: SortKey::Power,
             selected: 0,
             scroll: 0,
             filter_query: String::new(),
             filter_input: None,
             power_history: Vec::new(),
-            cpu_history: Vec::new(),
             visible_indices: Vec::new(),
             visible_dirty: true,
         };
@@ -170,21 +144,10 @@ impl App {
             let ra = &self.snapshot.rows[*a];
             let rb = &self.snapshot.rows[*b];
 
-            match self.sort {
-                SortKey::Power => rb
-                    .power_num
-                    .partial_cmp(&ra.power_num)
-                    .unwrap_or(Ordering::Equal),
-                SortKey::Cpu => rb
-                    .cpu_num
-                    .partial_cmp(&ra.cpu_num)
-                    .unwrap_or(Ordering::Equal),
-                SortKey::Mem => rb
-                    .mem_num
-                    .partial_cmp(&ra.mem_num)
-                    .unwrap_or(Ordering::Equal),
-            }
-            .then_with(|| ra.process.cmp(&rb.process))
+            rb.power_num
+                .partial_cmp(&ra.power_num)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| ra.process.cmp(&rb.process))
         });
 
         self.visible_dirty = false;
@@ -213,25 +176,11 @@ impl App {
 
     fn record_history(&mut self) {
         self.power_history.push(self.snapshot.total_power);
-        self.cpu_history.push(self.snapshot.total_cpu);
 
         if self.power_history.len() > HISTORY_LIMIT {
             let extra = self.power_history.len() - HISTORY_LIMIT;
             self.power_history.drain(0..extra);
         }
-        if self.cpu_history.len() > HISTORY_LIMIT {
-            let extra = self.cpu_history.len() - HISTORY_LIMIT;
-            self.cpu_history.drain(0..extra);
-        }
-    }
-
-    fn set_sort(&mut self, sort: SortKey) {
-        self.sort = sort;
-        self.mark_visible_dirty();
-        self.selected = 0;
-        self.scroll = 0;
-        let visible_len = self.visible_len();
-        self.normalize_selection(visible_len);
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -367,9 +316,6 @@ impl App {
             KeyCode::Char('g') => self.select_top(),
             KeyCode::Char('G') => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
-            KeyCode::Char('p') | KeyCode::Char('P') => self.set_sort(SortKey::Power),
-            KeyCode::Char('c') | KeyCode::Char('C') => self.set_sort(SortKey::Cpu),
-            KeyCode::Char('m') | KeyCode::Char('M') => self.set_sort(SortKey::Mem),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Enter => self.toggle_details(),
             _ => {}
@@ -394,10 +340,7 @@ fn main() -> io::Result<()> {
                         .unwrap_or(Ordering::Equal)
                 });
                 for row in rows.into_iter().take(10) {
-                    println!(
-                        "{:>6}  {:<24}  {:>6}  {:>8}  {:>8}",
-                        row.pid, row.process, row.cpu, row.mem, row.power
-                    );
+                    println!("{:>6}  {:<32}  {:>8}", row.pid, row.process, row.power);
                 }
                 return Ok(());
             }
@@ -572,7 +515,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .and_then(|idx| app.snapshot.rows.get(*idx))
         .cloned();
 
-    let graph_ratio = if app.show_details { 56 } else { 62 };
+    let graph_ratio = if app.show_details { 52 } else { 58 };
     let layout = Layout::vertical([
         Constraint::Length(1),
         Constraint::Percentage(graph_ratio),
@@ -632,7 +575,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let stats_title = if app.filter_input.is_some() {
         "Stats • / editing • Enter apply • Esc cancel".to_string()
     } else {
-        "Stats • / filter • p/c/m sort • space pause • q quit".to_string()
+        "Stats • / filter • space pause • q quit".to_string()
     };
 
     let mut stats_lines = vec![
@@ -642,10 +585,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 format!("{visible_len}/{}", app.snapshot.rows.len()),
                 Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("sort ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(app.sort.as_str(), Style::default().fg(COLOR_ACCENT)),
         ]),
         Line::from(vec![
             Span::styled("filter ", Style::default().fg(COLOR_MUTED)),
@@ -663,15 +602,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             Span::styled(
                 format!("{:.1}", app.snapshot.total_power),
                 Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("cpu ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{:.1}%", app.snapshot.total_cpu),
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -702,24 +632,12 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         power_data.push(0);
     }
 
-    let mut cpu_data: Vec<u64> = app
-        .cpu_history
-        .iter()
-        .map(|v| (v.max(0.0) * 10.0) as u64)
-        .collect();
-    if cpu_data.is_empty() {
-        cpu_data.push(0);
-    }
-
-    let signals_block = panel_block().title("Signals • Enter toggles selected pane");
+    let signals_block = panel_block().title("Power history • Enter toggles selected pane");
     let signals_inner = signals_block.inner(top[1]);
     frame.render_widget(signals_block, top[1]);
 
-    let signal_rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(signals_inner);
-
     let power_panel =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(signal_rows[0]);
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(signals_inner);
     let power_label = Paragraph::new(Line::from(vec![
         Span::styled("POWER ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
@@ -736,27 +654,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .data(&power_data)
         .style(Style::default().fg(COLOR_RED).bg(COLOR_BG));
     frame.render_widget(power_chart, power_panel[1]);
-
-    let cpu_panel =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(signal_rows[1]);
-    let cpu_label = Paragraph::new(Line::from(vec![
-        Span::styled("CPU   ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(
-            format!("{:.1}%", app.snapshot.total_cpu),
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  • {} points", cpu_data.len()),
-            Style::default().fg(COLOR_MUTED),
-        ),
-    ]));
-    frame.render_widget(cpu_label, cpu_panel[0]);
-    let cpu_chart = Sparkline::default()
-        .data(&cpu_data)
-        .style(Style::default().fg(COLOR_ACCENT).bg(COLOR_BG));
-    frame.render_widget(cpu_chart, cpu_panel[1]);
 
     let (table_area, detail_area) = if app.show_details {
         let split = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
@@ -792,8 +689,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             Cell::from(r.pid.to_string()),
             Cell::from(r.process.clone()),
             Cell::from(r.power.clone()).style(Style::default().fg(COLOR_RED)),
-            Cell::from(r.cpu.clone()).style(Style::default().fg(COLOR_ACCENT)),
-            Cell::from(r.mem.clone()).style(Style::default().fg(COLOR_YELLOW)),
         ])
         .style(Style::default().fg(COLOR_FG))
     });
@@ -802,8 +697,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Cell::from("PID"),
         Cell::from("PROCESS"),
         Cell::from("POWER"),
-        Cell::from("CPU"),
-        Cell::from("MEM"),
     ])
     .style(
         Style::default()
@@ -826,15 +719,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         )
     } else if app.filter_query.is_empty() {
         format!(
-            "Processes {visible_len}/{} • {} ↓ • j/k ↑/↓ • g/G • {detail_hint}",
+            "Processes {visible_len}/{} • power ↓ • j/k ↑/↓ • g/G • {detail_hint}",
             app.snapshot.rows.len(),
-            app.sort.as_str(),
         )
     } else {
         format!(
-            "Processes {visible_len}/{} • {} ↓ • filter: {} • {detail_hint}",
+            "Processes {visible_len}/{} • power ↓ • filter: {} • {detail_hint}",
             app.snapshot.rows.len(),
-            app.sort.as_str(),
             app.filter_query,
         )
     };
@@ -843,10 +734,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         rows,
         [
             Constraint::Length(7),
-            Constraint::Percentage(56),
+            Constraint::Percentage(70),
             Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(11),
         ],
     )
     .header(header_row)
@@ -875,11 +764,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             } else {
                 0.0
             };
-            let cpu_share = if app.snapshot.total_cpu > 0.0 {
-                (row.cpu_num / app.snapshot.total_cpu) * 100.0
-            } else {
-                0.0
-            };
 
             vec![
                 Line::from(Span::styled(
@@ -896,22 +780,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                         row.power.clone(),
                         Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  cpu ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        row.cpu.clone(),
-                        Style::default()
-                            .fg(COLOR_ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("mem ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        row.mem.clone(),
-                        Style::default()
-                            .fg(COLOR_YELLOW)
-                            .add_modifier(Modifier::BOLD),
-                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
@@ -923,13 +791,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 Line::from(vec![
                     Span::styled("share ", Style::default().fg(COLOR_MUTED)),
                     Span::styled(
-                        format!("{power_share:.1}% pwr"),
+                        format!("{power_share:.1}% of total"),
                         Style::default().fg(COLOR_RED),
-                    ),
-                    Span::styled("  ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        format!("{cpu_share:.1}% cpu"),
-                        Style::default().fg(COLOR_ACCENT),
                     ),
                 ]),
                 Line::from(Span::styled(
@@ -974,13 +837,8 @@ fn fetch_snapshot() -> io::Result<Snapshot> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let rows = parse_second_sample(&stdout);
     let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
-    let total_cpu = rows.iter().map(|r| r.cpu_num).sum::<f64>();
 
-    Ok(Snapshot {
-        rows,
-        total_power,
-        total_cpu,
-    })
+    Ok(Snapshot { rows, total_power })
 }
 
 fn parse_second_sample(raw: &str) -> Vec<ProcRow> {
@@ -1019,27 +877,20 @@ fn parse_second_sample(raw: &str) -> Vec<ProcRow> {
 
 fn parse_row(line: &str) -> Option<ProcRow> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 5 {
+    if parts.len() < 3 {
         return None;
     }
 
     let pid = parts[0].parse::<i32>().ok()?;
-
     let power = parts.last()?.to_string();
-    let mem = parts.get(parts.len().saturating_sub(2))?.to_string();
-    let cpu = parts.get(parts.len().saturating_sub(3))?.to_string();
-    let process = parts[1..parts.len().saturating_sub(3)].join(" ");
+    let process = parts[1..parts.len().saturating_sub(1)].join(" ");
     let process_lc = process.to_lowercase();
 
     Some(ProcRow {
         pid,
         process,
         process_lc,
-        cpu_num: parse_numeric_value(&cpu),
-        mem_num: parse_mem_value(&mem),
         power_num: parse_numeric_value(&power),
-        cpu,
-        mem,
         power,
     })
 }
@@ -1052,31 +903,6 @@ fn parse_numeric_value(s: &str) -> f64 {
     cleaned.parse::<f64>().unwrap_or(0.0)
 }
 
-fn parse_mem_value(s: &str) -> f64 {
-    let mut number = String::new();
-    let mut suffix = None;
-
-    for ch in s.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            number.push(ch);
-        } else if ch.is_ascii_alphabetic() {
-            suffix = Some(ch.to_ascii_uppercase());
-            break;
-        }
-    }
-
-    let base = number.parse::<f64>().unwrap_or(0.0);
-    let multiplier = match suffix {
-        Some('K') => 1024.0,
-        Some('M') => 1024.0 * 1024.0,
-        Some('G') => 1024.0 * 1024.0 * 1024.0,
-        Some('T') => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => 1.0,
-    };
-
-    base * multiplier
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,13 +911,13 @@ mod tests {
     fn parse_second_sample_keeps_only_last_pid_block() {
         let raw = r#"
 Processes: 123 total
-PID COMMAND %CPU MEM POWER
-1 launchd 0.0 15M 0.2
-2 Finder 1.2 87M 1.9
+PID COMMAND POWER
+1 launchd 0.2
+2 Finder 1.9
 
-PID COMMAND %CPU MEM POWER
-99 Safari 15.8 420M 12.3
-100 Google Chrome Helper 3.1 118M 4.6
+PID COMMAND POWER
+99 Safari 12.3
+100 Google Chrome Helper 4.6
 "#;
 
         let rows = parse_second_sample(raw);
@@ -1103,20 +929,16 @@ PID COMMAND %CPU MEM POWER
 
     #[test]
     fn parse_row_supports_multi_word_process_name() {
-        let row = parse_row("4242 Google Chrome Helper 7.4 512M 9.1").expect("row should parse");
+        let row = parse_row("4242 Google Chrome Helper 9.1").expect("row should parse");
 
         assert_eq!(row.pid, 4242);
         assert_eq!(row.process, "Google Chrome Helper");
-        assert_eq!(row.cpu, "7.4");
-        assert_eq!(row.mem, "512M");
         assert_eq!(row.power, "9.1");
-        assert!((row.mem_num - (512.0 * 1024.0 * 1024.0)).abs() < 1.0);
+        assert!((row.power_num - 9.1).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn parse_mem_value_handles_suffixes() {
-        assert!((parse_mem_value("2K") - 2048.0).abs() < f64::EPSILON);
-        assert!((parse_mem_value("2M") - (2.0 * 1024.0 * 1024.0)).abs() < 1.0);
-        assert!((parse_mem_value("1.5G") - (1.5 * 1024.0 * 1024.0 * 1024.0)).abs() < 1.0);
+    fn parse_row_rejects_missing_columns() {
+        assert!(parse_row("123 onlypid").is_none());
     }
 }

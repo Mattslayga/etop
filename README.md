@@ -1,26 +1,24 @@
 # etop
 
-Local-only macOS TUI process viewer focused on power usage.
+Local-only macOS TUI process viewer focused on power usage and energy impact.
 
 ## Data source
 
-`etop` keeps the sample-primed semantics:
+`etop` keeps sample-primed macOS semantics:
 
-- `top -l 2 -s 0 -o power -stats pid,command,cpu,mem,power`
+- `top -l 2 -s 0 -o power -stats pid,command,power`
 - Parses the **second** sample
 
 ## UI
 
 OneDark-inspired multi-pane layout:
 
-- Header/status bar (live/paused, loading, sort)
-- Stats panel (mode, totals, filter, visible rows)
-- History sparklines:
-  - aggregate power
-  - aggregate CPU
-- Scrollable/selectable process table with highlighted selected row
-- Selected-process detail pane (PID, process, power, CPU, mem)
-- Controls footer
+- Header/status bar (live/paused, loading)
+- Stats panel (rows, filter, aggregate power, details state)
+- Aggregate power history sparkline
+- Scrollable/selectable process table (PID, process, power)
+- Selected-process detail pane (PID, process, power, rank/share)
+- Inline control hints in panel titles/status text
 
 Palette cues used in the TUI:
 
@@ -39,8 +37,8 @@ Palette cues used in the TUI:
   - type to edit filter
   - `Enter` apply
   - `Esc` cancel edit and keep current filter
-- `p/c/m` sort by power/cpu/mem (desc)
 - `space` pause/resume refresh
+- `Enter` toggle selected-process details pane
 
 ## Run
 
