@@ -6,7 +6,7 @@ Local-only macOS TUI process viewer focused on power usage.
 
 `etop` keeps the sample-primed semantics:
 
-- `top -l 2 -o power -stats pid,command,cpu,mem,power`
+- `top -l 2 -s 0 -o power -stats pid,command,cpu,mem,power`
 - Parses the **second** sample
 
 ## UI

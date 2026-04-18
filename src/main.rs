@@ -4,7 +4,7 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -14,7 +14,17 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState},
 };
 
-const TOP_CMD: &str = "top -l 2 -o power -stats pid,command,cpu,mem,power";
+const TOP_BIN: &str = "top";
+const TOP_ARGS: [&str; 8] = [
+    "-l",
+    "2",
+    "-s",
+    "0",
+    "-o",
+    "power",
+    "-stats",
+    "pid,command,cpu,mem,power",
+];
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const HISTORY_LIMIT: usize = 90;
@@ -429,25 +439,53 @@ fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
 fn collector_loop(event_tx: Sender<CollectorEvent>, cmd_rx: Receiver<CollectorCommand>) {
     let mut paused = false;
+    let mut next_fetch_start = Instant::now();
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                CollectorCommand::SetPaused(next) => paused = next,
-                CollectorCommand::Stop => return,
+            if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+                return;
             }
         }
 
         if paused {
             match cmd_rx.recv() {
-                Ok(CollectorCommand::SetPaused(next)) => {
-                    paused = next;
+                Ok(cmd) => {
+                    if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+                        return;
+                    }
                 }
-                Ok(CollectorCommand::Stop) | Err(_) => return,
+                Err(_) => return,
             }
             continue;
         }
 
+        let now = Instant::now();
+        if now < next_fetch_start {
+            let wait_for = next_fetch_start - now;
+            match cmd_rx.recv_timeout(wait_for) {
+                Ok(cmd) => {
+                    if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+                        return;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+                return;
+            }
+        }
+
+        if paused {
+            continue;
+        }
+
+        let fetch_started = Instant::now();
         match fetch_snapshot() {
             Ok(snapshot) => {
                 if event_tx.send(CollectorEvent::Snapshot(snapshot)).is_err() {
@@ -464,12 +502,25 @@ fn collector_loop(event_tx: Sender<CollectorEvent>, cmd_rx: Receiver<CollectorCo
             }
         }
 
-        match cmd_rx.recv_timeout(REFRESH_EVERY) {
-            Ok(CollectorCommand::SetPaused(next)) => paused = next,
-            Ok(CollectorCommand::Stop) => return,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+        next_fetch_start = fetch_started + REFRESH_EVERY;
+    }
+}
+
+fn handle_collector_command(
+    cmd: CollectorCommand,
+    paused: &mut bool,
+    next_fetch_start: &mut Instant,
+) -> bool {
+    match cmd {
+        CollectorCommand::SetPaused(next) => {
+            let was_paused = *paused;
+            *paused = next;
+            if was_paused && !*paused {
+                *next_fetch_start = Instant::now();
+            }
+            false
         }
+        CollectorCommand::Stop => true,
     }
 }
 
@@ -639,13 +690,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume".to_string()
     };
 
-    let footer = Paragraph::new(footer_text)
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    let footer =
+        Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, layout[3]);
 }
 
 fn fetch_snapshot() -> io::Result<Snapshot> {
-    let output = Command::new("sh").arg("-c").arg(TOP_CMD).output()?;
+    let output = Command::new(TOP_BIN).args(TOP_ARGS).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
