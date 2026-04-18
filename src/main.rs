@@ -2,6 +2,8 @@ use std::{
     cmp::Ordering,
     io,
     process::Command,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -14,6 +16,7 @@ use ratatui::{
 
 const TOP_CMD: &str = "top -l 2 -o power -stats pid,command,cpu,mem,power";
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const HISTORY_LIMIT: usize = 90;
 
 #[derive(Debug, Clone)]
@@ -53,10 +56,23 @@ impl SortKey {
     }
 }
 
+#[derive(Debug)]
+enum CollectorCommand {
+    SetPaused(bool),
+    Stop,
+}
+
+#[derive(Debug)]
+enum CollectorEvent {
+    Snapshot(Snapshot),
+    Error(String),
+}
+
 struct App {
     snapshot: Snapshot,
     last_error: Option<String>,
-    last_refresh: Instant,
+    last_snapshot_at: Option<Instant>,
+    loading: bool,
     paused: bool,
     sort: SortKey,
     selected: usize,
@@ -71,18 +87,11 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let (snapshot, last_error) = match fetch_snapshot() {
-            Ok(snapshot) => (snapshot, None),
-            Err(err) => (
-                Snapshot::default(),
-                Some(format!("initial fetch failed: {err}")),
-            ),
-        };
-
         let mut app = Self {
-            snapshot,
-            last_error,
-            last_refresh: Instant::now(),
+            snapshot: Snapshot::default(),
+            last_error: None,
+            last_snapshot_at: None,
+            loading: true,
             paused: false,
             sort: SortKey::Power,
             selected: 0,
@@ -95,7 +104,6 @@ impl App {
             visible_dirty: true,
         };
 
-        app.record_history();
         let visible_len = app.visible_len();
         app.normalize_selection(visible_len);
         app
@@ -237,9 +245,6 @@ impl App {
 
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
-        if !self.paused {
-            self.last_refresh = Instant::now() - REFRESH_EVERY;
-        }
     }
 
     fn start_filter_input(&mut self) {
@@ -291,26 +296,43 @@ impl App {
         self.normalize_selection(visible_len);
     }
 
-    fn refresh_if_due(&mut self) {
-        if self.paused || self.last_refresh.elapsed() < REFRESH_EVERY {
-            return;
-        }
+    fn apply_snapshot(&mut self, next: Snapshot) {
+        self.snapshot = next;
+        self.last_snapshot_at = Some(Instant::now());
+        self.last_error = None;
+        self.loading = false;
+        self.mark_visible_dirty();
+        self.record_history();
 
-        match fetch_snapshot() {
-            Ok(next) => {
-                self.snapshot = next;
-                self.mark_visible_dirty();
-                self.last_error = None;
-                self.record_history();
-            }
-            Err(err) => {
-                self.last_error = Some(format!("refresh failed: {err}"));
-            }
-        }
-
-        self.last_refresh = Instant::now();
         let visible_len = self.visible_len();
         self.normalize_selection(visible_len);
+    }
+
+    fn apply_refresh_error(&mut self, err: String) {
+        self.loading = false;
+        self.last_error = Some(format!("refresh failed: {err}"));
+    }
+
+    fn apply_collector_event(&mut self, event: CollectorEvent) {
+        match event {
+            CollectorEvent::Snapshot(next) => self.apply_snapshot(next),
+            CollectorEvent::Error(err) => self.apply_refresh_error(err),
+        }
+    }
+
+    fn display_filter_text(&self) -> String {
+        if self.active_filter().is_empty() {
+            "(none)".to_string()
+        } else {
+            self.active_filter().to_string()
+        }
+    }
+
+    fn refresh_age_text(&self) -> String {
+        match self.last_snapshot_at {
+            Some(at) => format_duration_ago(at.elapsed()),
+            None => "never".to_string(),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -382,28 +404,99 @@ fn run_tui() -> io::Result<()> {
 
 fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
+    let (event_tx, event_rx) = mpsc::channel::<CollectorEvent>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCommand>();
 
-    loop {
-        terminal.draw(|f| draw_ui(f, &mut app))?;
+    let collector = thread::spawn(move || collector_loop(event_tx, cmd_rx));
 
-        let timeout = if app.paused {
-            Duration::from_millis(200)
-        } else {
-            REFRESH_EVERY.saturating_sub(app.last_refresh.elapsed())
-        };
+    let loop_result = (|| -> io::Result<()> {
+        loop {
+            drain_collector_events(&mut app, &event_rx);
+            terminal.draw(|f| draw_ui(f, &mut app))?;
 
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key) {
-                    break;
+            if event::poll(REDRAW_EVERY)? {
+                if let Event::Key(key) = event::read()? {
+                    let was_paused = app.paused;
+                    if app.handle_key(key) {
+                        break;
+                    }
+
+                    if app.paused != was_paused {
+                        let _ = cmd_tx.send(CollectorCommand::SetPaused(app.paused));
+                    }
                 }
             }
         }
 
-        app.refresh_if_due();
-    }
+        Ok(())
+    })();
 
-    Ok(())
+    let _ = cmd_tx.send(CollectorCommand::Stop);
+    let _ = collector.join();
+
+    loop_result
+}
+
+fn collector_loop(event_tx: Sender<CollectorEvent>, cmd_rx: Receiver<CollectorCommand>) {
+    let mut paused = false;
+
+    loop {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                CollectorCommand::SetPaused(next) => paused = next,
+                CollectorCommand::Stop => return,
+            }
+        }
+
+        if paused {
+            match cmd_rx.recv() {
+                Ok(CollectorCommand::SetPaused(next)) => {
+                    paused = next;
+                }
+                Ok(CollectorCommand::Stop) | Err(_) => return,
+            }
+            continue;
+        }
+
+        match fetch_snapshot() {
+            Ok(snapshot) => {
+                if event_tx.send(CollectorEvent::Snapshot(snapshot)).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                if event_tx
+                    .send(CollectorEvent::Error(err.to_string()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        match cmd_rx.recv_timeout(REFRESH_EVERY) {
+            Ok(CollectorCommand::SetPaused(next)) => paused = next,
+            Ok(CollectorCommand::Stop) => return,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn drain_collector_events(app: &mut App, event_rx: &Receiver<CollectorEvent>) {
+    while let Ok(event) = event_rx.try_recv() {
+        app.apply_collector_event(event);
+    }
+}
+
+fn format_duration_ago(elapsed: Duration) -> String {
+    if elapsed.as_secs() >= 60 {
+        let mins = elapsed.as_secs() / 60;
+        let secs = elapsed.as_secs() % 60;
+        format!("{mins}m{secs:02}s ago")
+    } else {
+        format!("{:.1}s ago", elapsed.as_secs_f64())
+    }
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
@@ -411,7 +504,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Constraint::Length(3),
         Constraint::Length(9),
         Constraint::Min(8),
-        Constraint::Length(2),
+        Constraint::Length(5),
     ])
     .split(frame.area());
 
@@ -425,19 +518,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(mid[1]);
 
     let mode = if app.paused { "paused" } else { "live" };
-    let filter_display = app.active_filter();
-    let filter_text = if filter_display.is_empty() {
-        "(none)".to_string()
-    } else {
-        filter_display.to_string()
-    };
+    let load_state = if app.loading { "loading" } else { "ready" };
+    let filter_text = app.display_filter_text();
 
     let summary = Paragraph::new(format!(
-        "mode: {mode}\nrows: {}\nsort: {} desc\nagg power: {:.1}\nagg cpu: {:.1}%\nfilter: {}",
+        "mode: {mode} ({load_state})\nrows: {}\nsort: {} desc\nagg power: {:.1}\nagg cpu: {:.1}%\nrefresh age: {}\nfilter: {}",
         app.snapshot.rows.len(),
         app.sort.as_str(),
         app.snapshot.total_power,
         app.snapshot.total_cpu,
+        app.refresh_age_text(),
         filter_text,
     ))
     .block(Block::default().borders(Borders::ALL).title("Stats"));
@@ -561,17 +651,32 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
-    let refresh_state = if app.paused { "paused" } else { "refreshing" };
-    let status_error = app
-        .last_error
-        .as_deref()
-        .map(|e| format!(" | {e}"))
-        .unwrap_or_default();
+    let selection_state = if visible_len == 0 {
+        "none".to_string()
+    } else {
+        format!("{}/{}", app.selected + 1, visible_len)
+    };
 
+    let filter_state = if app.filter_input.is_some() {
+        format!("editing \"{}\"", app.active_filter())
+    } else if app.filter_query.is_empty() {
+        "(none)".to_string()
+    } else {
+        format!("\"{}\"", app.filter_query)
+    };
+
+    let error_state = app.last_error.as_deref().unwrap_or("none");
     let footer = Paragraph::new(format!(
-        "q quit | j/k,↑/↓ move | g/G top/bottom | / filter (Enter apply, Esc cancel) | p/c/m sort | space pause ({refresh_state}){status_error}"
+        "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume\nstate: mode={mode} load={load_state} refresh={} sort={} filter={} selection={} rows={}/{}\nerror: {}",
+        app.refresh_age_text(),
+        app.sort.as_str(),
+        filter_state,
+        selection_state,
+        visible_len,
+        app.snapshot.rows.len(),
+        error_state,
     ))
-    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    .block(Block::default().borders(Borders::ALL).title("Controls / State"));
     frame.render_widget(footer, layout[3]);
 }
 
@@ -689,4 +794,48 @@ fn parse_mem_value(s: &str) -> f64 {
     };
 
     base * multiplier
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_second_sample_keeps_only_last_pid_block() {
+        let raw = r#"
+Processes: 123 total
+PID COMMAND %CPU MEM POWER
+1 launchd 0.0 15M 0.2
+2 Finder 1.2 87M 1.9
+
+PID COMMAND %CPU MEM POWER
+99 Safari 15.8 420M 12.3
+100 Google Chrome Helper 3.1 118M 4.6
+"#;
+
+        let rows = parse_second_sample(raw);
+        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
+
+        assert_eq!(pids, vec![99, 100]);
+        assert_eq!(rows[1].process, "Google Chrome Helper");
+    }
+
+    #[test]
+    fn parse_row_supports_multi_word_process_name() {
+        let row = parse_row("4242 Google Chrome Helper 7.4 512M 9.1").expect("row should parse");
+
+        assert_eq!(row.pid, 4242);
+        assert_eq!(row.process, "Google Chrome Helper");
+        assert_eq!(row.cpu, "7.4");
+        assert_eq!(row.mem, "512M");
+        assert_eq!(row.power, "9.1");
+        assert!((row.mem_num - (512.0 * 1024.0 * 1024.0)).abs() < 1.0);
+    }
+
+    #[test]
+    fn parse_mem_value_handles_suffixes() {
+        assert!((parse_mem_value("2K") - 2048.0).abs() < f64::EPSILON);
+        assert!((parse_mem_value("2M") - (2.0 * 1024.0 * 1024.0)).abs() < 1.0);
+        assert!((parse_mem_value("1.5G") - (1.5 * 1024.0 * 1024.0 * 1024.0)).abs() < 1.0);
+    }
 }
