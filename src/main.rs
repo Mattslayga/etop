@@ -50,7 +50,7 @@ fn main() -> io::Result<()> {
             }
             Err(err) => {
                 eprintln!("etop: failed to fetch top data: {err}");
-                return Ok(());
+                return Err(io::Error::other(format!("failed to fetch top data: {err}")));
             }
         }
     }
@@ -74,8 +74,13 @@ fn run_tui() -> io::Result<()> {
 }
 
 fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    let mut snapshot = fetch_snapshot().unwrap_or_else(|_| Snapshot { rows: vec![] });
-    let mut last_error: Option<String> = None;
+    let (mut snapshot, mut last_error) = match fetch_snapshot() {
+        Ok(snapshot) => (snapshot, None),
+        Err(err) => (
+            Snapshot { rows: vec![] },
+            Some(format!("initial fetch failed: {err}")),
+        ),
+    };
     let mut last_refresh = Instant::now();
 
     loop {
