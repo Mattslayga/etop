@@ -27,7 +27,7 @@ const TOP_ARGS: [&str; 8] = [
 ];
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
-const HISTORY_LIMIT: usize = 90;
+const HISTORY_LIMIT: usize = 240;
 
 const COLOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
 const COLOR_FG: Color = Color::Rgb(0xab, 0xb2, 0xbf);
@@ -566,8 +566,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .cloned();
 
     let layout = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Length(6),
         Constraint::Min(8),
         Constraint::Length(3),
     ])
@@ -583,61 +583,59 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             .fg(COLOR_GREEN)
             .add_modifier(Modifier::BOLD)
     };
+    let load_state = if app.loading { "loading" } else { "ready" };
+    let filter_display = app.display_filter_text();
 
-    let header = Paragraph::new(Line::from(vec![
+    let top_bar = Paragraph::new(Line::from(vec![
         Span::styled(
             "etop",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(mode, mode_style),
+        Span::styled(format!(" • {load_state}"), Style::default().fg(COLOR_MUTED)),
+        Span::styled(" • sort:", Style::default().fg(COLOR_MUTED)),
+        Span::styled(app.sort.as_str(), Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" • filter:", Style::default().fg(COLOR_MUTED)),
         Span::styled(
-            "  macOS power/process monitor  ",
+            filter_display.clone(),
+            if filter_display == "(none)" {
+                Style::default().fg(COLOR_MUTED)
+            } else {
+                Style::default().fg(COLOR_FG)
+            },
+        ),
+        Span::styled(" • rows:", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            format!("{visible_len}/{}", app.snapshot.rows.len()),
             Style::default().fg(COLOR_FG),
         ),
-        Span::styled(mode, mode_style),
-        Span::styled(
-            if app.loading {
-                " • loading"
-            } else {
-                " • ready"
-            },
-            Style::default().fg(COLOR_MUTED),
-        ),
-        Span::styled(
-            format!(" • sort: {}", app.sort.as_str()),
-            Style::default().fg(COLOR_ACCENT),
-        ),
     ]))
-    .block(panel_block().title("Overview"));
-    frame.render_widget(header, layout[0]);
+    .style(base_style);
+    frame.render_widget(top_bar, layout[0]);
 
-    let top = Layout::horizontal([
-        Constraint::Percentage(36),
-        Constraint::Percentage(32),
-        Constraint::Percentage(32),
-    ])
-    .split(layout[1]);
+    let top = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(layout[1]);
 
     let stats = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Rows: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled("Rows ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
-                app.snapshot.rows.len().to_string(),
-                Style::default().fg(COLOR_FG),
+                format!("{visible_len}/{}", app.snapshot.rows.len()),
+                Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  Visible: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(visible_len.to_string(), Style::default().fg(COLOR_FG)),
         ]),
         Line::from(vec![
-            Span::styled("Power: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled("Power ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
                 format!("{:.1}", app.snapshot.total_power),
                 Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("CPU: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled("CPU ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
                 format!("{:.1}%", app.snapshot.total_cpu),
                 Style::default()
@@ -646,57 +644,81 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Filter: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(app.display_filter_text(), Style::default().fg(COLOR_FG)),
+            Span::styled("Filter ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                filter_display.clone(),
+                if filter_display == "(none)" {
+                    Style::default().fg(COLOR_MUTED)
+                } else {
+                    Style::default().fg(COLOR_FG)
+                },
+            ),
         ]),
-        if app.filter_input.is_some() {
-            Line::from(Span::styled(
-                "Editing filter (/ to type, Enter apply, Esc cancel)",
-                Style::default().fg(COLOR_YELLOW),
-            ))
-        } else {
-            Line::from(Span::styled(
-                "Press / to filter • p/c/m to sort",
-                Style::default().fg(COLOR_MUTED),
-            ))
-        },
     ])
     .block(panel_block().title("Stats"))
     .wrap(Wrap { trim: true });
     frame.render_widget(stats, top[0]);
 
-    let power_data: Vec<u64> = if app.power_history.is_empty() {
-        vec![0]
-    } else {
-        app.power_history
-            .iter()
-            .map(|v| (v.max(0.0) * 10.0) as u64)
-            .collect()
-    };
+    let mut power_data: Vec<u64> = app
+        .power_history
+        .iter()
+        .map(|v| (v.max(0.0) * 10.0) as u64)
+        .collect();
+    if power_data.is_empty() {
+        power_data.push(0);
+    }
 
-    let cpu_data: Vec<u64> = if app.cpu_history.is_empty() {
-        vec![0]
-    } else {
-        app.cpu_history
-            .iter()
-            .map(|v| (v.max(0.0) * 10.0) as u64)
-            .collect()
-    };
+    let mut cpu_data: Vec<u64> = app
+        .cpu_history
+        .iter()
+        .map(|v| (v.max(0.0) * 10.0) as u64)
+        .collect();
+    if cpu_data.is_empty() {
+        cpu_data.push(0);
+    }
 
+    let signals_block = panel_block().title("Signals");
+    let signals_inner = signals_block.inner(top[1]);
+    frame.render_widget(signals_block, top[1]);
+
+    let signal_rows =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(2)]).split(signals_inner);
+
+    let power_row =
+        Layout::horizontal([Constraint::Length(16), Constraint::Min(1)]).split(signal_rows[0]);
+    let power_label = Paragraph::new(Line::from(vec![
+        Span::styled("PWR ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            format!("{:.1}", app.snapshot.total_power),
+            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(power_label, power_row[0]);
     let power_chart = Sparkline::default()
-        .block(panel_block().title("Power history"))
         .data(&power_data)
-        .style(Style::default().fg(COLOR_RED));
-    frame.render_widget(power_chart, top[1]);
+        .style(Style::default().fg(COLOR_RED).bg(COLOR_BG));
+    frame.render_widget(power_chart, power_row[1]);
 
+    let cpu_row =
+        Layout::horizontal([Constraint::Length(16), Constraint::Min(1)]).split(signal_rows[1]);
+    let cpu_label = Paragraph::new(Line::from(vec![
+        Span::styled("CPU ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            format!("{:.1}%", app.snapshot.total_cpu),
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(cpu_label, cpu_row[0]);
     let cpu_chart = Sparkline::default()
-        .block(panel_block().title("CPU history"))
         .data(&cpu_data)
-        .style(Style::default().fg(COLOR_ACCENT));
-    frame.render_widget(cpu_chart, top[2]);
+        .style(Style::default().fg(COLOR_ACCENT).bg(COLOR_BG));
+    frame.render_widget(cpu_chart, cpu_row[1]);
 
-    let main = Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)])
+    let main = Layout::horizontal([Constraint::Percentage(78), Constraint::Percentage(22)])
         .split(layout[2]);
+    let side = Layout::vertical([Constraint::Length(9), Constraint::Min(4)]).split(main[1]);
 
     let table_area = main[0];
     let rows_visible = table_area.height.saturating_sub(3) as usize;
@@ -746,19 +768,34 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     );
 
     let table_title = if app.filter_input.is_some() {
-        format!("Processes • filter: {}", app.active_filter())
+        format!(
+            "Processes {visible_len}/{} • filtering: {}",
+            app.snapshot.rows.len(),
+            app.active_filter()
+        )
+    } else if app.filter_query.is_empty() {
+        format!(
+            "Processes {visible_len}/{} • {} ↓",
+            app.snapshot.rows.len(),
+            app.sort.as_str()
+        )
     } else {
-        format!("Processes • sort: {} desc", app.sort.as_str())
+        format!(
+            "Processes {visible_len}/{} • {} ↓ • {}",
+            app.snapshot.rows.len(),
+            app.sort.as_str(),
+            app.filter_query
+        )
     };
 
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
-            Constraint::Percentage(50),
+            Constraint::Length(7),
+            Constraint::Percentage(56),
             Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Length(11),
         ],
     )
     .header(header_row)
@@ -781,52 +818,66 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
     let detail_lines = if let Some(row) = selected_process {
+        let power_share = if app.snapshot.total_power > 0.0 {
+            (row.power_num / app.snapshot.total_power) * 100.0
+        } else {
+            0.0
+        };
+        let cpu_share = if app.snapshot.total_cpu > 0.0 {
+            (row.cpu_num / app.snapshot.total_cpu) * 100.0
+        } else {
+            0.0
+        };
+
         vec![
+            Line::from(Span::styled(
+                row.process.clone(),
+                Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+            )),
             Line::from(vec![
-                Span::styled("PID: ", Style::default().fg(COLOR_MUTED)),
-                Span::styled(
-                    row.pid.to_string(),
-                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
             ]),
             Line::from(vec![
-                Span::styled("Process: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
                 Span::styled(
-                    row.process,
-                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Power: ", Style::default().fg(COLOR_MUTED)),
-                Span::styled(
-                    row.power,
+                    row.power.clone(),
                     Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("CPU: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled("  cpu ", Style::default().fg(COLOR_MUTED)),
                 Span::styled(
-                    row.cpu,
+                    row.cpu.clone(),
                     Style::default()
                         .fg(COLOR_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Mem: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled("mem ", Style::default().fg(COLOR_MUTED)),
                 Span::styled(
-                    row.mem,
+                    row.mem.clone(),
                     Style::default()
                         .fg(COLOR_YELLOW)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
-                Span::styled("Selection: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
                 Span::styled(
-                    format!("{}/{}", app.selected + 1, visible_len),
+                    format!("#{} / {}", app.selected + 1, visible_len),
                     Style::default().fg(COLOR_FG),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("share ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    format!("{power_share:.1}% pwr"),
+                    Style::default().fg(COLOR_RED),
+                ),
+                Span::styled("  ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    format!("{cpu_share:.1}% cpu"),
+                    Style::default().fg(COLOR_ACCENT),
                 ),
             ]),
         ]
@@ -836,18 +887,70 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 "No matching process",
                 Style::default().fg(COLOR_MUTED),
             )),
-            Line::from(""),
             Line::from(Span::styled(
-                "Adjust filter or wait for next refresh.",
+                "Adjust filter or wait for refresh.",
                 Style::default().fg(COLOR_MUTED),
             )),
         ]
     };
 
     let detail = Paragraph::new(detail_lines)
-        .block(panel_block().title("Selected process"))
+        .block(panel_block().title("Selected"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(detail, main[1]);
+    frame.render_widget(detail, side[0]);
+
+    let selection_state = if visible_len == 0 {
+        "none".to_string()
+    } else {
+        format!("{}/{}", app.selected + 1, visible_len)
+    };
+
+    let mut context_lines = vec![
+        Line::from(vec![
+            Span::styled("mode ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(mode, mode_style),
+        ]),
+        Line::from(vec![
+            Span::styled("load ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                load_state,
+                if app.loading {
+                    Style::default().fg(COLOR_YELLOW)
+                } else {
+                    Style::default().fg(COLOR_GREEN)
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("sort ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(app.sort.as_str(), Style::default().fg(COLOR_ACCENT)),
+        ]),
+        Line::from(vec![
+            Span::styled("filter ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(filter_display, Style::default().fg(COLOR_FG)),
+        ]),
+        Line::from(vec![
+            Span::styled("sel ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(selection_state, Style::default().fg(COLOR_FG)),
+        ]),
+    ];
+
+    if let Some(error) = app.last_error.as_deref() {
+        context_lines.push(Line::from(vec![
+            Span::styled("error ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(error, Style::default().fg(COLOR_RED)),
+        ]));
+    } else {
+        context_lines.push(Line::from(vec![
+            Span::styled("error ", Style::default().fg(COLOR_MUTED)),
+            Span::styled("none", Style::default().fg(COLOR_MUTED)),
+        ]));
+    }
+
+    let context = Paragraph::new(context_lines)
+        .block(panel_block().title("Session"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(context, side[1]);
 
     let mut footer_line = vec![
         Span::styled("q", Style::default().fg(COLOR_ACCENT)),
@@ -875,7 +978,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let footer = Paragraph::new(Line::from(footer_line))
         .block(panel_block().title("Controls"))
         .wrap(Wrap { trim: false });
-
     frame.render_widget(footer, layout[3]);
 }
 
