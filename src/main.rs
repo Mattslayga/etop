@@ -4,7 +4,7 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -15,7 +15,7 @@ use ratatui::{
 };
 
 const TOP_CMD: &str = "top -l 2 -o power -stats pid,command,cpu,mem,power";
-const REFRESH_EVERY: Duration = Duration::from_secs(2);
+const REFRESH_EVERY: Duration = Duration::from_secs(1);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const HISTORY_LIMIT: usize = 90;
 
@@ -71,7 +71,6 @@ enum CollectorEvent {
 struct App {
     snapshot: Snapshot,
     last_error: Option<String>,
-    last_snapshot_at: Option<Instant>,
     loading: bool,
     paused: bool,
     sort: SortKey,
@@ -90,7 +89,6 @@ impl App {
         let mut app = Self {
             snapshot: Snapshot::default(),
             last_error: None,
-            last_snapshot_at: None,
             loading: true,
             paused: false,
             sort: SortKey::Power,
@@ -298,7 +296,6 @@ impl App {
 
     fn apply_snapshot(&mut self, next: Snapshot) {
         self.snapshot = next;
-        self.last_snapshot_at = Some(Instant::now());
         self.last_error = None;
         self.loading = false;
         self.mark_visible_dirty();
@@ -325,13 +322,6 @@ impl App {
             "(none)".to_string()
         } else {
             self.active_filter().to_string()
-        }
-    }
-
-    fn refresh_age_text(&self) -> String {
-        match self.last_snapshot_at {
-            Some(at) => format_duration_ago(at.elapsed()),
-            None => "never".to_string(),
         }
     }
 
@@ -489,22 +479,12 @@ fn drain_collector_events(app: &mut App, event_rx: &Receiver<CollectorEvent>) {
     }
 }
 
-fn format_duration_ago(elapsed: Duration) -> String {
-    if elapsed.as_secs() >= 60 {
-        let mins = elapsed.as_secs() / 60;
-        let secs = elapsed.as_secs() % 60;
-        format!("{mins}m{secs:02}s ago")
-    } else {
-        format!("{:.1}s ago", elapsed.as_secs_f64())
-    }
-}
-
 fn draw_ui(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(9),
+        Constraint::Length(8),
         Constraint::Min(8),
-        Constraint::Length(5),
+        Constraint::Length(4),
     ])
     .split(frame.area());
 
@@ -522,12 +502,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let filter_text = app.display_filter_text();
 
     let summary = Paragraph::new(format!(
-        "mode: {mode} ({load_state})\nrows: {}\nsort: {} desc\nagg power: {:.1}\nagg cpu: {:.1}%\nrefresh age: {}\nfilter: {}",
+        "mode: {mode} ({load_state})\nrows: {}\nsort: {} desc\nagg power: {:.1}\nagg cpu: {:.1}%\nfilter: {}",
         app.snapshot.rows.len(),
         app.sort.as_str(),
         app.snapshot.total_power,
         app.snapshot.total_cpu,
-        app.refresh_age_text(),
         filter_text,
     ))
     .block(Block::default().borders(Borders::ALL).title("Stats"));
@@ -651,32 +630,17 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
-    let selection_state = if visible_len == 0 {
-        "none".to_string()
+    let footer_text = if let Some(error) = app.last_error.as_deref() {
+        format!(
+            "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume\nerror: {}",
+            error
+        )
     } else {
-        format!("{}/{}", app.selected + 1, visible_len)
+        "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume".to_string()
     };
 
-    let filter_state = if app.filter_input.is_some() {
-        format!("editing \"{}\"", app.active_filter())
-    } else if app.filter_query.is_empty() {
-        "(none)".to_string()
-    } else {
-        format!("\"{}\"", app.filter_query)
-    };
-
-    let error_state = app.last_error.as_deref().unwrap_or("none");
-    let footer = Paragraph::new(format!(
-        "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume\nstate: mode={mode} load={load_state} refresh={} sort={} filter={} selection={} rows={}/{}\nerror: {}",
-        app.refresh_age_text(),
-        app.sort.as_str(),
-        filter_state,
-        selection_state,
-        visible_len,
-        app.snapshot.rows.len(),
-        error_state,
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Controls / State"));
+    let footer = Paragraph::new(footer_text)
+        .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, layout[3]);
 }
 
