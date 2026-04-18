@@ -1,25 +1,43 @@
-# etop (MVP)
+# etop
 
-Minimal local-only TUI process viewer for macOS power usage.
+Local-only macOS TUI process viewer focused on power usage.
 
-## Features
+## Data source
 
-- Live refresh (2s)
-- Process table with: PID, process, power, CPU, MEM
-- Sorted by power descending
-- Quit key: `q`
-- Header/footer with source + refresh hints
-- Uses:
-  - `top -l 2 -o power -stats pid,command,cpu,mem,power`
-  - Parses the **second sample**
+`etop` keeps the sample-primed semantics:
+
+- `top -l 2 -o power -stats pid,command,cpu,mem,power`
+- Parses the **second** sample
+
+## UI
+
+Multi-pane layout:
+
+- Header/status
+- Stats panel (mode, totals, filter, sort)
+- History sparklines:
+  - aggregate power
+  - aggregate CPU
+- Scrollable/selectable process table
+- Controls footer
+
+## Controls
+
+- `q` quit
+- `j/k` or `↑/↓` move selection
+- `g/G` jump to top/bottom
+- `/` start filter input
+  - type to edit filter
+  - `Enter` apply
+  - `Esc` clear/cancel filter
+- `p/c/m` sort by power/cpu/mem (desc)
+- `space` pause/resume refresh
 
 ## Run
 
 ```bash
 cargo run
 ```
-
-Then press `q` to quit.
 
 ## Non-interactive smoke mode
 
