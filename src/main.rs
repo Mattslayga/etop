@@ -11,7 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
 const TOP_BIN: &str = "top";
@@ -38,6 +38,11 @@ const COLOR_GREEN: Color = Color::Rgb(0x98, 0xc3, 0x79);
 const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 
+const BRAILLE_5X5: [char; 25] = [
+    ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
+    '⣾', '⡇', '⣇', '⣧', '⣷', '⣿',
+];
+
 #[derive(Debug, Clone)]
 struct ProcRow {
     pid: i32,
@@ -51,6 +56,12 @@ struct ProcRow {
 struct Snapshot {
     rows: Vec<ProcRow>,
     total_power: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PinnedProcess {
+    pid: i32,
+    process: String,
 }
 
 #[derive(Debug)]
@@ -70,7 +81,7 @@ struct App {
     last_error: Option<String>,
     loading: bool,
     paused: bool,
-    show_details: bool,
+    pinned: Option<PinnedProcess>,
     selected: usize,
     scroll: usize,
     filter_query: String,
@@ -87,7 +98,7 @@ impl App {
             last_error: None,
             loading: true,
             paused: false,
-            show_details: false,
+            pinned: None,
             selected: 0,
             scroll: 0,
             filter_query: String::new(),
@@ -215,8 +226,27 @@ impl App {
         self.paused = !self.paused;
     }
 
-    fn toggle_details(&mut self) {
-        self.show_details = !self.show_details;
+    fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
+    }
+
+    fn toggle_pin(&mut self) {
+        if self.pinned.is_some() {
+            self.pinned = None;
+            return;
+        }
+
+        self.rebuild_visible_if_needed();
+        let Some(snapshot_idx) = self.visible_indices.get(self.selected).copied() else {
+            return;
+        };
+
+        if let Some(row) = self.snapshot.rows.get(snapshot_idx) {
+            self.pinned = Some(PinnedProcess {
+                pid: row.pid,
+                process: row.process.clone(),
+            });
+        }
     }
 
     fn start_filter_input(&mut self) {
@@ -299,6 +329,16 @@ impl App {
         }
     }
 
+    fn status_hint(&self) -> &'static str {
+        if self.filter_input.is_some() {
+            "filter edit: Enter apply • Esc cancel"
+        } else if self.pinned.is_some() {
+            "Enter unpin • / filter • space pause • q quit"
+        } else {
+            "j/k move • Enter pin • / filter • space pause • q quit"
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
@@ -311,13 +351,13 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('g') => self.select_top(),
-            KeyCode::Char('G') => self.select_bottom(),
+            KeyCode::Char('j') | KeyCode::Down if !self.is_pinned() => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up if !self.is_pinned() => self.move_selection(-1),
+            KeyCode::Char('g') if !self.is_pinned() => self.select_top(),
+            KeyCode::Char('G') if !self.is_pinned() => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
             KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Enter => self.toggle_details(),
+            KeyCode::Enter => self.toggle_pin(),
             _ => {}
         }
 
@@ -501,6 +541,85 @@ fn panel_block() -> Block<'static> {
         .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
 }
 
+fn history_range(values: &[f64]) -> Option<(f64, f64)> {
+    let mut iter = values.iter().copied();
+    let first = iter.next()?;
+
+    let mut min = first;
+    let mut max = first;
+
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+
+    Some((min, max))
+}
+
+fn resample_history(values: &[f64], points: usize) -> Vec<f64> {
+    if points == 0 {
+        return Vec::new();
+    }
+
+    if values.is_empty() {
+        return vec![0.0; points];
+    }
+
+    if values.len() == 1 {
+        return vec![values[0]; points];
+    }
+
+    if points == 1 {
+        return vec![*values.last().unwrap_or(&0.0)];
+    }
+
+    let mut sampled = Vec::with_capacity(points);
+    let max_index = (values.len() - 1) as f64;
+
+    for i in 0..points {
+        let t = i as f64 / (points - 1) as f64;
+        let pos = t * max_index;
+        let low = pos.floor() as usize;
+        let high = pos.ceil() as usize;
+
+        if low == high {
+            sampled.push(values[low]);
+            continue;
+        }
+
+        let frac = pos - low as f64;
+        sampled.push(values[low] + (values[high] - values[low]) * frac);
+    }
+
+    sampled
+}
+
+fn quantize_level(value: f64, min: f64, max: f64) -> usize {
+    if (max - min).abs() < f64::EPSILON {
+        return if value <= 0.0 { 0 } else { 4 };
+    }
+
+    (((value - min) * 4.0 / (max - min)).round()).clamp(0.0, 4.0) as usize
+}
+
+fn braille_history_line(values: &[f64], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let samples = resample_history(values, width + 1);
+    let (min, max) = history_range(&samples).unwrap_or((0.0, 0.0));
+
+    let mut line = String::with_capacity(width * 3);
+    for pair in samples.windows(2).take(width) {
+        let prev_level = quantize_level(pair[0], min, max);
+        let curr_level = quantize_level(pair[1], min, max);
+        line.push(BRAILLE_5X5[prev_level * 5 + curr_level]);
+    }
+
+    line
+}
+
 fn draw_ui(frame: &mut Frame, app: &mut App) {
     let base_style = Style::default().bg(COLOR_BG).fg(COLOR_FG);
     frame.render_widget(Block::default().style(base_style), frame.area());
@@ -509,11 +628,22 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let visible_len = app.visible_indices.len();
     app.normalize_selection(visible_len);
 
-    let selected_process = app
-        .visible_indices
-        .get(app.selected)
-        .and_then(|idx| app.snapshot.rows.get(*idx))
+    let pinned = app.pinned.clone();
+    let pinned_row = pinned
+        .as_ref()
+        .and_then(|pin| {
+            app.snapshot
+                .rows
+                .iter()
+                .find(|row| row.pid == pin.pid && row.process == pin.process)
+        })
         .cloned();
+
+    let pinned_rank = pinned.as_ref().and_then(|pin| {
+        app.visible_indices.iter().position(|idx| {
+            app.snapshot.rows[*idx].pid == pin.pid && app.snapshot.rows[*idx].process == pin.process
+        })
+    });
 
     let layout = Layout::vertical([
         Constraint::Length(1),
@@ -541,11 +671,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let filter_display = app.display_filter_text();
-    let details_state = if app.show_details {
-        "details:on"
-    } else {
-        "details:off"
-    };
 
     let mut top_spans = vec![
         Span::styled(
@@ -577,9 +702,21 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(COLOR_FG)
             },
         ),
-        Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(details_state, Style::default().fg(COLOR_ACCENT)),
     ];
+
+    if let Some(pin) = pinned.as_ref() {
+        top_spans.push(Span::styled(" • pinned:", Style::default().fg(COLOR_MUTED)));
+        top_spans.push(Span::styled(
+            pin.pid.to_string(),
+            Style::default().fg(COLOR_ACCENT),
+        ));
+    }
+
+    top_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
+    top_spans.push(Span::styled(
+        app.status_hint(),
+        Style::default().fg(COLOR_MUTED),
+    ));
 
     if let Some(error) = app.last_error.as_deref() {
         top_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
@@ -594,27 +731,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(top_bar, layout[0]);
 
-    let mut power_data: Vec<u64> = app
-        .power_history
-        .iter()
-        .map(|v| (v.max(0.0) * 10.0) as u64)
-        .collect();
-    if power_data.is_empty() {
-        power_data.push(0);
-    }
-
-    let graph_title = if app.filter_input.is_some() {
-        "Power history • / editing • Enter apply • Esc cancel".to_string()
-    } else {
-        "Power history • / filter • Enter details • space pause • q quit".to_string()
-    };
-
-    let graph_block = panel_block().title(graph_title);
+    let graph_block = panel_block().title("Power history (braille)");
     let graph_inner = graph_block.inner(layout[1]);
     frame.render_widget(graph_block, layout[1]);
 
     let graph_rows =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(graph_inner);
+
+    let (history_min, history_max) = history_range(&app.power_history).unwrap_or((0.0, 0.0));
     let graph_label = Paragraph::new(Line::from(vec![
         Span::styled("POWER ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
@@ -622,19 +746,25 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  • {} points", power_data.len()),
+            format!(
+                "  • {} points  • range {:.1}–{:.1}",
+                app.power_history.len(),
+                history_min,
+                history_max
+            ),
             Style::default().fg(COLOR_MUTED),
         ),
     ]));
     frame.render_widget(graph_label, graph_rows[0]);
 
-    let power_chart = Sparkline::default()
-        .data(&power_data)
-        .style(Style::default().fg(COLOR_RED).bg(COLOR_BG));
-    frame.render_widget(power_chart, graph_rows[1]);
+    let graph_line = braille_history_line(&app.power_history, graph_rows[1].width as usize);
+    let graph = Paragraph::new(graph_line)
+        .style(Style::default().fg(COLOR_RED).bg(COLOR_BG))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(graph, graph_rows[1]);
 
     let table_region = layout[2];
-    let (detail_area, rows_area) = if app.show_details {
+    let (detail_area, rows_area) = if pinned.is_some() {
         let min_rows: u16 = 6;
         let max_detail = table_region.height.saturating_sub(min_rows);
 
@@ -653,67 +783,72 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     if let Some(detail_rect) = detail_area {
-        let detail_lines = if let Some(row) = selected_process {
-            let power_share = if app.snapshot.total_power > 0.0 {
-                (row.power_num / app.snapshot.total_power) * 100.0
-            } else {
-                0.0
-            };
+        let detail_lines = match (pinned.as_ref(), pinned_row.as_ref()) {
+            (Some(_), Some(row)) => {
+                let power_share = if app.snapshot.total_power > 0.0 {
+                    (row.power_num / app.snapshot.total_power) * 100.0
+                } else {
+                    0.0
+                };
 
-            vec![
+                let rank_text = pinned_rank
+                    .map(|rank| format!("#{} / {}", rank + 1, visible_len))
+                    .unwrap_or_else(|| "not in current filtered list".to_string());
+
+                vec![
+                    Line::from(Span::styled(
+                        row.process.clone(),
+                        Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(vec![
+                        Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled(
+                            row.power.clone(),
+                            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled(rank_text, Style::default().fg(COLOR_FG)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("share ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled(
+                            format!("{power_share:.1}% of total"),
+                            Style::default().fg(COLOR_RED),
+                        ),
+                    ]),
+                ]
+            }
+            (Some(pin), None) => vec![
                 Line::from(Span::styled(
-                    row.process.clone(),
+                    format!("{} ({})", pin.process, pin.pid),
                     Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
                 )),
-                Line::from(vec![
-                    Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
-                ]),
-                Line::from(vec![
-                    Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        row.power.clone(),
-                        Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        format!("#{} / {}", app.selected + 1, visible_len),
-                        Style::default().fg(COLOR_FG),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("share ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        format!("{power_share:.1}% of total"),
-                        Style::default().fg(COLOR_RED),
-                    ),
-                ]),
                 Line::from(Span::styled(
-                    "Enter to hide details",
+                    "Not present in the latest top sample.",
                     Style::default().fg(COLOR_MUTED),
                 )),
-            ]
+                Line::from(Span::styled(
+                    "Process may have exited or changed state.",
+                    Style::default().fg(COLOR_MUTED),
+                )),
+            ],
+            _ => vec![],
+        };
+
+        let detail_title = if let Some(pin) = pinned.as_ref() {
+            format!("Pinned process {} • Enter unpin", pin.pid)
         } else {
-            vec![
-                Line::from(Span::styled(
-                    "No matching process",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Adjust filter or wait for refresh.",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Enter to hide details",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-            ]
+            "Pinned process".to_string()
         };
 
         let detail = Paragraph::new(detail_lines)
-            .block(panel_block().title("Selected • Enter hide"))
+            .block(panel_block().title(detail_title))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, detail_rect);
     }
@@ -740,12 +875,26 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     let rows = app.visible_indices[start..end].iter().map(|idx| {
         let r = &app.snapshot.rows[*idx];
+        let is_pinned_row = pinned
+            .as_ref()
+            .map(|pin| pin.pid == r.pid && pin.process == r.process)
+            .unwrap_or(false);
+
+        let row_style = if is_pinned_row {
+            Style::default()
+                .bg(COLOR_SELECTED_BG)
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_FG)
+        };
+
         Row::new([
             Cell::from(r.pid.to_string()),
             Cell::from(r.process.clone()),
             Cell::from(r.power.clone()).style(Style::default().fg(COLOR_RED)),
         ])
-        .style(Style::default().fg(COLOR_FG))
+        .style(row_style)
     });
 
     let header_row = Row::new([
@@ -760,29 +909,40 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let detail_hint = if app.show_details {
-        "Enter hide details"
-    } else {
-        "Enter show details"
-    };
+    let pin_suffix = pinned
+        .as_ref()
+        .map(|pin| format!(" • pinned pid {}", pin.pid))
+        .unwrap_or_default();
 
     let table_title = if app.filter_input.is_some() {
         format!(
-            "Processes {visible_len}/{} • filtering: {} • Enter apply",
+            "Processes {visible_len}/{} • filter edit: {}{}",
             app.snapshot.rows.len(),
-            app.active_filter()
+            app.active_filter(),
+            pin_suffix,
         )
     } else if app.filter_query.is_empty() {
         format!(
-            "Processes {visible_len}/{} • power ↓ • j/k ↑/↓ • g/G • {detail_hint}",
+            "Processes {visible_len}/{} • power ↓{}",
             app.snapshot.rows.len(),
+            pin_suffix,
         )
     } else {
         format!(
-            "Processes {visible_len}/{} • power ↓ • filter: {} • {detail_hint}",
+            "Processes {visible_len}/{} • power ↓ • filter: {}{}",
             app.snapshot.rows.len(),
             app.filter_query,
+            pin_suffix,
         )
+    };
+
+    let highlight_style = if app.is_pinned() {
+        Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+            .bg(COLOR_SELECTED_BG)
+            .fg(COLOR_FG)
+            .add_modifier(Modifier::BOLD)
     };
 
     let table = Table::new(
@@ -797,14 +957,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     .block(panel_block().title(table_title))
     .column_spacing(1)
     .style(Style::default().fg(COLOR_FG).bg(COLOR_BG))
-    .row_highlight_style(
-        Style::default()
-            .bg(COLOR_SELECTED_BG)
-            .fg(COLOR_FG)
-            .add_modifier(Modifier::BOLD),
-    );
+    .row_highlight_style(highlight_style);
 
-    let selected_in_window = if visible_len == 0 {
+    let selected_in_window = if visible_len == 0 || app.is_pinned() {
         None
     } else {
         Some(app.selected.saturating_sub(start))
@@ -929,5 +1084,17 @@ PID COMMAND POWER
     #[test]
     fn parse_row_rejects_missing_columns() {
         assert!(parse_row("123 onlypid").is_none());
+    }
+
+    #[test]
+    fn braille_history_line_uses_lookup_mapping() {
+        let line = braille_history_line(&[0.0, 10.0], 1);
+        assert_eq!(line, "⢸");
+    }
+
+    #[test]
+    fn braille_history_line_defaults_to_blanks_when_empty() {
+        let line = braille_history_line(&[], 4);
+        assert_eq!(line, "    ");
     }
 }

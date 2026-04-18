@@ -13,11 +13,12 @@ Local-only macOS TUI process viewer focused on power usage and energy impact.
 
 OneDark-inspired multi-pane layout:
 
-- Thin single-line status strip (mode, load, rows, power, filter, detail state)
-- Aggregate power history area (roughly top third)
+- Thin single-line status strip (mode, load, rows, power, filter, pinned PID when active)
+- Aggregate **braille-style** power history area (roughly top third)
 - Process table area (roughly bottom two thirds)
-- Optional selected-process detail pane that opens above rows within the table region
-- Inline control hints in panel titles/status text
+- Optional pinned-process detail pane that opens above rows within the table region
+- Details are locked to the pinned PID/process until unpinned
+- Cursor highlight is hidden while pinned so the detail view feels held/fixed
 
 Palette cues used in the TUI:
 
@@ -30,14 +31,14 @@ Palette cues used in the TUI:
 ## Controls
 
 - `q` quit
-- `j/k` or `↑/↓` move selection
-- `g/G` jump to top/bottom
+- `j/k` or `↑/↓` move selection (when not pinned)
+- `g/G` jump to top/bottom (when not pinned)
 - `/` start filter input
   - type to edit filter
   - `Enter` apply
   - `Esc` cancel edit and keep current filter
 - `space` pause/resume refresh
-- `Enter` toggle selected-process details pane
+- `Enter` pin/unpin process details
 
 ## Run
 
