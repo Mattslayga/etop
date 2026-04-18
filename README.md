@@ -29,7 +29,7 @@ Multi-pane layout:
 - `/` start filter input
   - type to edit filter
   - `Enter` apply
-  - `Esc` clear/cancel filter
+  - `Esc` cancel edit and keep current filter
 - `p/c/m` sort by power/cpu/mem (desc)
 - `space` pause/resume refresh
 

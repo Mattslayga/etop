@@ -5,11 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     prelude::*,
     widgets::{
@@ -236,7 +232,6 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                self.filter_query.clear();
                 self.filter_input = None;
                 self.selected = 0;
                 self.scroll = 0;
@@ -343,17 +338,9 @@ fn main() -> io::Result<()> {
 }
 
 fn run_tui() -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = ratatui::init();
-
     let result = app_loop(&mut terminal);
-
     ratatui::restore();
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-
     result
 }
 
@@ -545,7 +532,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .unwrap_or_default();
 
     let footer = Paragraph::new(format!(
-        "q quit | j/k,↑/↓ move | g/G top/bottom | / filter (Enter apply, Esc clear) | p/c/m sort | space pause ({refresh_state}){status_error}"
+        "q quit | j/k,↑/↓ move | g/G top/bottom | / filter (Enter apply, Esc cancel) | p/c/m sort | space pause ({refresh_state}){status_error}"
     ))
     .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, layout[3]);
