@@ -11,7 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap},
 };
 
 const TOP_BIN: &str = "top";
@@ -28,6 +28,15 @@ const TOP_ARGS: [&str; 8] = [
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const HISTORY_LIMIT: usize = 90;
+
+const COLOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
+const COLOR_FG: Color = Color::Rgb(0xab, 0xb2, 0xbf);
+const COLOR_ACCENT: Color = Color::Rgb(0x61, 0xaf, 0xef);
+const COLOR_MUTED: Color = Color::Rgb(0x5c, 0x63, 0x70);
+const COLOR_SELECTED_BG: Color = Color::Rgb(0x2c, 0x31, 0x3c);
+const COLOR_GREEN: Color = Color::Rgb(0x98, 0xc3, 0x79);
+const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
+const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 
 #[derive(Debug, Clone)]
 struct ProcRow {
@@ -530,38 +539,131 @@ fn drain_collector_events(app: &mut App, event_rx: &Receiver<CollectorEvent>) {
     }
 }
 
+fn panel_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_MUTED))
+        .title_style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
+}
+
 fn draw_ui(frame: &mut Frame, app: &mut App) {
+    let base_style = Style::default().bg(COLOR_BG).fg(COLOR_FG);
+    frame.render_widget(Block::default().style(base_style), frame.area());
+
+    app.rebuild_visible_if_needed();
+    let visible_len = app.visible_indices.len();
+    app.normalize_selection(visible_len);
+
+    let selected_process = app
+        .visible_indices
+        .get(app.selected)
+        .and_then(|idx| app.snapshot.rows.get(*idx))
+        .cloned();
+
     let layout = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(8),
+        Constraint::Length(7),
         Constraint::Min(8),
-        Constraint::Length(4),
+        Constraint::Length(3),
     ])
     .split(frame.area());
 
-    let header = Paragraph::new("etop — macOS power/process monitor")
-        .block(Block::default().borders(Borders::ALL).title("Overview"));
+    let mode = if app.paused { "PAUSED" } else { "LIVE" };
+    let mode_style = if app.paused {
+        Style::default()
+            .fg(COLOR_YELLOW)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(COLOR_GREEN)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "etop",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  macOS power/process monitor  ",
+            Style::default().fg(COLOR_FG),
+        ),
+        Span::styled(mode, mode_style),
+        Span::styled(
+            if app.loading {
+                " • loading"
+            } else {
+                " • ready"
+            },
+            Style::default().fg(COLOR_MUTED),
+        ),
+        Span::styled(
+            format!(" • sort: {}", app.sort.as_str()),
+            Style::default().fg(COLOR_ACCENT),
+        ),
+    ]))
+    .block(panel_block().title("Overview"));
     frame.render_widget(header, layout[0]);
 
-    let mid = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(layout[1]);
-    let charts =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(mid[1]);
+    let top = Layout::horizontal([
+        Constraint::Percentage(36),
+        Constraint::Percentage(32),
+        Constraint::Percentage(32),
+    ])
+    .split(layout[1]);
 
-    let mode = if app.paused { "paused" } else { "live" };
-    let load_state = if app.loading { "loading" } else { "ready" };
-    let filter_text = app.display_filter_text();
-
-    let summary = Paragraph::new(format!(
-        "mode: {mode} ({load_state})\nrows: {}\nsort: {} desc\nagg power: {:.1}\nagg cpu: {:.1}%\nfilter: {}",
-        app.snapshot.rows.len(),
-        app.sort.as_str(),
-        app.snapshot.total_power,
-        app.snapshot.total_cpu,
-        filter_text,
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Stats"));
-    frame.render_widget(summary, mid[0]);
+    let stats = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Rows: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                app.snapshot.rows.len().to_string(),
+                Style::default().fg(COLOR_FG),
+            ),
+            Span::styled("  Visible: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(visible_len.to_string(), Style::default().fg(COLOR_FG)),
+        ]),
+        Line::from(vec![
+            Span::styled("Power: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.1}", app.snapshot.total_power),
+                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.1}%", app.snapshot.total_cpu),
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(app.display_filter_text(), Style::default().fg(COLOR_FG)),
+        ]),
+        if app.filter_input.is_some() {
+            Line::from(Span::styled(
+                "Editing filter (/ to type, Enter apply, Esc cancel)",
+                Style::default().fg(COLOR_YELLOW),
+            ))
+        } else {
+            Line::from(Span::styled(
+                "Press / to filter • p/c/m to sort",
+                Style::default().fg(COLOR_MUTED),
+            ))
+        },
+    ])
+    .block(panel_block().title("Stats"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(stats, top[0]);
 
     let power_data: Vec<u64> = if app.power_history.is_empty() {
         vec![0]
@@ -582,30 +684,21 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let power_chart = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Aggregate power history"),
-        )
+        .block(panel_block().title("Power history"))
         .data(&power_data)
-        .style(Style::default().fg(Color::LightRed));
-    frame.render_widget(power_chart, charts[0]);
+        .style(Style::default().fg(COLOR_RED));
+    frame.render_widget(power_chart, top[1]);
 
     let cpu_chart = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Aggregate CPU history"),
-        )
+        .block(panel_block().title("CPU history"))
         .data(&cpu_data)
-        .style(Style::default().fg(Color::LightBlue));
-    frame.render_widget(cpu_chart, charts[1]);
+        .style(Style::default().fg(COLOR_ACCENT));
+    frame.render_widget(cpu_chart, top[2]);
 
-    app.rebuild_visible_if_needed();
-    let visible_len = app.visible_indices.len();
-    app.normalize_selection(visible_len);
+    let main = Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)])
+        .split(layout[2]);
 
-    let table_area = layout[2];
+    let table_area = main[0];
     let rows_visible = table_area.height.saturating_sub(3) as usize;
 
     if rows_visible > 0 && visible_len > 0 {
@@ -626,17 +719,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         (start + rows_visible).min(visible_len)
     };
 
-    let visible = &app.visible_indices;
-
-    let rows = visible[start..end].iter().map(|idx| {
+    let rows = app.visible_indices[start..end].iter().map(|idx| {
         let r = &app.snapshot.rows[*idx];
         Row::new([
             Cell::from(r.pid.to_string()),
             Cell::from(r.process.clone()),
-            Cell::from(r.power.clone()),
-            Cell::from(r.cpu.clone()),
-            Cell::from(r.mem.clone()),
+            Cell::from(r.power.clone()).style(Style::default().fg(COLOR_RED)),
+            Cell::from(r.cpu.clone()).style(Style::default().fg(COLOR_ACCENT)),
+            Cell::from(r.mem.clone()).style(Style::default().fg(COLOR_YELLOW)),
         ])
+        .style(Style::default().fg(COLOR_FG))
     });
 
     let header_row = Row::new([
@@ -646,34 +738,41 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Cell::from("CPU"),
         Cell::from("MEM"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .bg(COLOR_SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+    );
 
-    let title = if app.filter_input.is_some() {
-        format!("Processes (filtering: {})", app.active_filter())
+    let table_title = if app.filter_input.is_some() {
+        format!("Processes • filter: {}", app.active_filter())
     } else {
-        format!("Processes (sort: {} desc)", app.sort.as_str())
+        format!("Processes • sort: {} desc", app.sort.as_str())
     };
 
     let table = Table::new(
         rows,
         [
             Constraint::Length(8),
-            Constraint::Percentage(48),
+            Constraint::Percentage(50),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(12),
         ],
     )
     .header(header_row)
-    .block(Block::default().borders(Borders::ALL).title(title))
+    .block(panel_block().title(table_title))
     .column_spacing(1)
+    .style(Style::default().fg(COLOR_FG).bg(COLOR_BG))
     .row_highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(COLOR_SELECTED_BG)
+            .fg(COLOR_FG)
             .add_modifier(Modifier::BOLD),
     );
 
-    let selected_in_window = if visible.is_empty() {
+    let selected_in_window = if visible_len == 0 {
         None
     } else {
         Some(app.selected.saturating_sub(start))
@@ -681,17 +780,102 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
-    let footer_text = if let Some(error) = app.last_error.as_deref() {
-        format!(
-            "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume\nerror: {}",
-            error
-        )
+    let detail_lines = if let Some(row) = selected_process {
+        vec![
+            Line::from(vec![
+                Span::styled("PID: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    row.pid.to_string(),
+                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Process: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    row.process,
+                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Power: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    row.power,
+                    Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("CPU: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    row.cpu,
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Mem: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    row.mem,
+                    Style::default()
+                        .fg(COLOR_YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Selection: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    format!("{}/{}", app.selected + 1, visible_len),
+                    Style::default().fg(COLOR_FG),
+                ),
+            ]),
+        ]
     } else {
-        "keys: q quit | j/k,↑/↓ move | g/G top/bottom | / filter | Enter apply | Esc cancel | p/c/m sort | space pause/resume".to_string()
+        vec![
+            Line::from(Span::styled(
+                "No matching process",
+                Style::default().fg(COLOR_MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Adjust filter or wait for next refresh.",
+                Style::default().fg(COLOR_MUTED),
+            )),
+        ]
     };
 
-    let footer =
-        Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
+    let detail = Paragraph::new(detail_lines)
+        .block(panel_block().title("Selected process"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, main[1]);
+
+    let mut footer_line = vec![
+        Span::styled("q", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" quit  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("j/k ↑/↓", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" move  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("g/G", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" top/btm  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("/", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" filter  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("p/c/m", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" sort  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("space", Style::default().fg(COLOR_ACCENT)),
+        Span::styled(" pause", Style::default().fg(COLOR_MUTED)),
+    ];
+
+    if let Some(error) = app.last_error.as_deref() {
+        footer_line.push(Span::styled("  •  ", Style::default().fg(COLOR_MUTED)));
+        footer_line.push(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(COLOR_RED),
+        ));
+    }
+
+    let footer = Paragraph::new(Line::from(footer_line))
+        .block(panel_block().title("Controls"))
+        .wrap(Wrap { trim: false });
+
     frame.render_widget(footer, layout[3]);
 }
 

@@ -11,15 +11,24 @@ Local-only macOS TUI process viewer focused on power usage.
 
 ## UI
 
-Multi-pane layout:
+OneDark-inspired multi-pane layout:
 
-- Header/status
-- Stats panel (mode, totals, filter, sort)
+- Header/status bar (live/paused, loading, sort)
+- Stats panel (mode, totals, filter, visible rows)
 - History sparklines:
   - aggregate power
   - aggregate CPU
-- Scrollable/selectable process table
+- Scrollable/selectable process table with highlighted selected row
+- Selected-process detail pane (PID, process, power, CPU, mem)
 - Controls footer
+
+Palette cues used in the TUI:
+
+- background: `#282c34`
+- foreground/title: `#abb2bf`
+- accent: `#61afef`
+- muted/borders: `#5c6370`
+- selected row background: `#2c313c`
 
 ## Controls
 
