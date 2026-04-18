@@ -13,11 +13,10 @@ Local-only macOS TUI process viewer focused on power usage and energy impact.
 
 OneDark-inspired multi-pane layout:
 
-- Header/status bar (live/paused, loading)
-- Stats panel (rows, filter, aggregate power, details state)
-- Aggregate power history sparkline
-- Scrollable/selectable process table (PID, process, power)
-- Selected-process detail pane (PID, process, power, rank/share)
+- Thin single-line status strip (mode, load, rows, power, filter, detail state)
+- Aggregate power history area (roughly top third)
+- Process table area (roughly bottom two thirds)
+- Optional selected-process detail pane that opens above rows within the table region
 - Inline control hints in panel titles/status text
 
 Palette cues used in the TUI:

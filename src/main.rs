@@ -515,10 +515,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .and_then(|idx| app.snapshot.rows.get(*idx))
         .cloned();
 
-    let graph_ratio = if app.show_details { 52 } else { 58 };
     let layout = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Percentage(graph_ratio),
+        Constraint::Percentage(34),
         Constraint::Min(8),
     ])
     .split(frame.area());
@@ -541,6 +540,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Style::default().fg(COLOR_GREEN)
     };
 
+    let filter_display = app.display_filter_text();
+    let details_state = if app.show_details {
+        "details:on"
+    } else {
+        "details:off"
+    };
+
     let mut top_spans = vec![
         Span::styled(
             "etop",
@@ -552,6 +558,27 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Span::styled(mode, mode_style),
         Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
         Span::styled(load_state, load_style),
+        Span::styled(" • rows:", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            format!("{visible_len}/{}", app.snapshot.rows.len()),
+            Style::default().fg(COLOR_FG),
+        ),
+        Span::styled(" • power:", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            format!("{:.1}", app.snapshot.total_power),
+            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" • filter:", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            filter_display,
+            if app.active_filter().is_empty() {
+                Style::default().fg(COLOR_MUTED)
+            } else {
+                Style::default().fg(COLOR_FG)
+            },
+        ),
+        Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(details_state, Style::default().fg(COLOR_ACCENT)),
     ];
 
     if let Some(error) = app.last_error.as_deref() {
@@ -567,62 +594,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(top_bar, layout[0]);
 
-    let top = Layout::horizontal([Constraint::Length(35), Constraint::Min(20)]).split(layout[1]);
-
-    let filter_display = app.display_filter_text();
-    let details_state = if app.show_details { "open" } else { "hidden" };
-
-    let stats_title = if app.filter_input.is_some() {
-        "Stats • / editing • Enter apply • Esc cancel".to_string()
-    } else {
-        "Stats • / filter • space pause • q quit".to_string()
-    };
-
-    let mut stats_lines = vec![
-        Line::from(vec![
-            Span::styled("rows ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{visible_len}/{}", app.snapshot.rows.len()),
-                Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("filter ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                filter_display.clone(),
-                if filter_display == "(none)" {
-                    Style::default().fg(COLOR_MUTED)
-                } else {
-                    Style::default().fg(COLOR_FG)
-                },
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("power ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{:.1}", app.snapshot.total_power),
-                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("details ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(details_state, Style::default().fg(COLOR_FG)),
-            Span::styled(" (Enter)", Style::default().fg(COLOR_MUTED)),
-        ]),
-    ];
-
-    if let Some(error) = app.last_error.as_deref() {
-        stats_lines.push(Line::from(vec![
-            Span::styled("error ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(error, Style::default().fg(COLOR_RED)),
-        ]));
-    }
-
-    let stats = Paragraph::new(stats_lines)
-        .block(panel_block().title(stats_title))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(stats, top[0]);
-
     let mut power_data: Vec<u64> = app
         .power_history
         .iter()
@@ -632,13 +603,19 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         power_data.push(0);
     }
 
-    let signals_block = panel_block().title("Power history • Enter toggles selected pane");
-    let signals_inner = signals_block.inner(top[1]);
-    frame.render_widget(signals_block, top[1]);
+    let graph_title = if app.filter_input.is_some() {
+        "Power history • / editing • Enter apply • Esc cancel".to_string()
+    } else {
+        "Power history • / filter • Enter details • space pause • q quit".to_string()
+    };
 
-    let power_panel =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(signals_inner);
-    let power_label = Paragraph::new(Line::from(vec![
+    let graph_block = panel_block().title(graph_title);
+    let graph_inner = graph_block.inner(layout[1]);
+    frame.render_widget(graph_block, layout[1]);
+
+    let graph_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(graph_inner);
+    let graph_label = Paragraph::new(Line::from(vec![
         Span::styled("POWER ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
             format!("{:.1}", app.snapshot.total_power),
@@ -649,21 +626,99 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             Style::default().fg(COLOR_MUTED),
         ),
     ]));
-    frame.render_widget(power_label, power_panel[0]);
+    frame.render_widget(graph_label, graph_rows[0]);
+
     let power_chart = Sparkline::default()
         .data(&power_data)
         .style(Style::default().fg(COLOR_RED).bg(COLOR_BG));
-    frame.render_widget(power_chart, power_panel[1]);
+    frame.render_widget(power_chart, graph_rows[1]);
 
-    let (table_area, detail_area) = if app.show_details {
-        let split = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(layout[2]);
-        (split[0], Some(split[1]))
+    let table_region = layout[2];
+    let (detail_area, rows_area) = if app.show_details {
+        let min_rows: u16 = 6;
+        let max_detail = table_region.height.saturating_sub(min_rows);
+
+        if max_detail >= 4 {
+            let preferred = (table_region.height * 35) / 100;
+            let detail_height = preferred.clamp(4, max_detail);
+            let split =
+                Layout::vertical([Constraint::Length(detail_height), Constraint::Min(min_rows)])
+                    .split(table_region);
+            (Some(split[0]), split[1])
+        } else {
+            (None, table_region)
+        }
     } else {
-        (layout[2], None)
+        (None, table_region)
     };
 
-    let rows_visible = table_area.height.saturating_sub(3) as usize;
+    if let Some(detail_rect) = detail_area {
+        let detail_lines = if let Some(row) = selected_process {
+            let power_share = if app.snapshot.total_power > 0.0 {
+                (row.power_num / app.snapshot.total_power) * 100.0
+            } else {
+                0.0
+            };
+
+            vec![
+                Line::from(Span::styled(
+                    row.process.clone(),
+                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(vec![
+                    Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(
+                        row.power.clone(),
+                        Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(
+                        format!("#{} / {}", app.selected + 1, visible_len),
+                        Style::default().fg(COLOR_FG),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("share ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(
+                        format!("{power_share:.1}% of total"),
+                        Style::default().fg(COLOR_RED),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    "Enter to hide details",
+                    Style::default().fg(COLOR_MUTED),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    "No matching process",
+                    Style::default().fg(COLOR_MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Adjust filter or wait for refresh.",
+                    Style::default().fg(COLOR_MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Enter to hide details",
+                    Style::default().fg(COLOR_MUTED),
+                )),
+            ]
+        };
+
+        let detail = Paragraph::new(detail_lines)
+            .block(panel_block().title("Selected • Enter hide"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(detail, detail_rect);
+    }
+
+    let rows_visible = rows_area.height.saturating_sub(3) as usize;
 
     if rows_visible > 0 && visible_len > 0 {
         if app.selected < app.scroll {
@@ -755,73 +810,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Some(app.selected.saturating_sub(start))
     };
     let mut table_state = TableState::default().with_selected(selected_in_window);
-    frame.render_stateful_widget(table, table_area, &mut table_state);
-
-    if let Some(detail_rect) = detail_area {
-        let detail_lines = if let Some(row) = selected_process {
-            let power_share = if app.snapshot.total_power > 0.0 {
-                (row.power_num / app.snapshot.total_power) * 100.0
-            } else {
-                0.0
-            };
-
-            vec![
-                Line::from(Span::styled(
-                    row.process.clone(),
-                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(vec![
-                    Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
-                ]),
-                Line::from(vec![
-                    Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        row.power.clone(),
-                        Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        format!("#{} / {}", app.selected + 1, visible_len),
-                        Style::default().fg(COLOR_FG),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("share ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(
-                        format!("{power_share:.1}% of total"),
-                        Style::default().fg(COLOR_RED),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    "Enter to hide details",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-            ]
-        } else {
-            vec![
-                Line::from(Span::styled(
-                    "No matching process",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Adjust filter or wait for refresh.",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Enter to hide details",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-            ]
-        };
-
-        let detail = Paragraph::new(detail_lines)
-            .block(panel_block().title("Selected • Enter hide"))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(detail, detail_rect);
-    }
+    frame.render_stateful_widget(table, rows_area, &mut table_state);
 }
 
 fn fetch_snapshot() -> io::Result<Snapshot> {
