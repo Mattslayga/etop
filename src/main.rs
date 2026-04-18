@@ -7,11 +7,9 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
-    prelude::*,
-    widgets::{
-        Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState,
-    },
     DefaultTerminal,
+    prelude::*,
+    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState},
 };
 
 const TOP_CMD: &str = "top -l 2 -o power -stats pid,command,cpu,mem,power";
@@ -22,6 +20,7 @@ const HISTORY_LIMIT: usize = 90;
 struct ProcRow {
     pid: i32,
     process: String,
+    process_lc: String,
     cpu: String,
     mem: String,
     power: String,
@@ -66,6 +65,8 @@ struct App {
     filter_input: Option<String>,
     power_history: Vec<f64>,
     cpu_history: Vec<f64>,
+    visible_indices: Vec<usize>,
+    visible_dirty: bool,
 }
 
 impl App {
@@ -90,10 +91,13 @@ impl App {
             filter_input: None,
             power_history: Vec::new(),
             cpu_history: Vec::new(),
+            visible_indices: Vec::new(),
+            visible_dirty: true,
         };
 
         app.record_history();
-        app.normalize_selection(app.visible_len());
+        let visible_len = app.visible_len();
+        app.normalize_selection(visible_len);
         app
     }
 
@@ -103,25 +107,39 @@ impl App {
             .unwrap_or(self.filter_query.as_str())
     }
 
-    fn visible_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
-            .snapshot
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                let q = self.active_filter().trim();
-                if q.is_empty() {
-                    return true;
-                }
+    fn mark_visible_dirty(&mut self) {
+        self.visible_dirty = true;
+    }
 
-                let q = q.to_lowercase();
-                row.process.to_lowercase().contains(&q) || row.pid.to_string().contains(&q)
-            })
-            .map(|(idx, _)| idx)
-            .collect();
+    fn rebuild_visible_if_needed(&mut self) {
+        if !self.visible_dirty {
+            return;
+        }
 
-        indices.sort_by(|a, b| {
+        let filter_lc = self.active_filter().trim().to_lowercase();
+        let has_filter = !filter_lc.is_empty();
+
+        self.visible_indices.clear();
+        self.visible_indices.reserve(
+            self.snapshot
+                .rows
+                .len()
+                .saturating_sub(self.visible_indices.len()),
+        );
+
+        for (idx, row) in self.snapshot.rows.iter().enumerate() {
+            let matches = if !has_filter {
+                true
+            } else {
+                row.process_lc.contains(&filter_lc) || row.pid.to_string().contains(&filter_lc)
+            };
+
+            if matches {
+                self.visible_indices.push(idx);
+            }
+        }
+
+        self.visible_indices.sort_by(|a, b| {
             let ra = &self.snapshot.rows[*a];
             let rb = &self.snapshot.rows[*b];
 
@@ -142,11 +160,12 @@ impl App {
             .then_with(|| ra.process.cmp(&rb.process))
         });
 
-        indices
+        self.visible_dirty = false;
     }
 
-    fn visible_len(&self) -> usize {
-        self.visible_indices().len()
+    fn visible_len(&mut self) -> usize {
+        self.rebuild_visible_if_needed();
+        self.visible_indices.len()
     }
 
     fn normalize_selection(&mut self, visible_len: usize) {
@@ -181,9 +200,11 @@ impl App {
 
     fn set_sort(&mut self, sort: SortKey) {
         self.sort = sort;
+        self.mark_visible_dirty();
         self.selected = 0;
         self.scroll = 0;
-        self.normalize_selection(self.visible_len());
+        let visible_len = self.visible_len();
+        self.normalize_selection(visible_len);
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -223,6 +244,7 @@ impl App {
 
     fn start_filter_input(&mut self) {
         self.filter_input = Some(self.filter_query.clone());
+        self.mark_visible_dirty();
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
@@ -230,32 +252,43 @@ impl App {
             return;
         };
 
+        let mut touched_filter = false;
+
         match key.code {
             KeyCode::Esc => {
                 self.filter_input = None;
                 self.selected = 0;
                 self.scroll = 0;
+                touched_filter = true;
             }
             KeyCode::Enter => {
                 self.filter_query = buf.clone();
                 self.filter_input = None;
                 self.selected = 0;
                 self.scroll = 0;
+                touched_filter = true;
             }
             KeyCode::Backspace => {
                 buf.pop();
                 self.selected = 0;
                 self.scroll = 0;
+                touched_filter = true;
             }
             KeyCode::Char(ch) => {
                 buf.push(ch);
                 self.selected = 0;
                 self.scroll = 0;
+                touched_filter = true;
             }
             _ => {}
         }
 
-        self.normalize_selection(self.visible_len());
+        if touched_filter {
+            self.mark_visible_dirty();
+        }
+
+        let visible_len = self.visible_len();
+        self.normalize_selection(visible_len);
     }
 
     fn refresh_if_due(&mut self) {
@@ -266,6 +299,7 @@ impl App {
         match fetch_snapshot() {
             Ok(next) => {
                 self.snapshot = next;
+                self.mark_visible_dirty();
                 self.last_error = None;
                 self.record_history();
             }
@@ -275,7 +309,8 @@ impl App {
         }
 
         self.last_refresh = Instant::now();
-        self.normalize_selection(self.visible_len());
+        let visible_len = self.visible_len();
+        self.normalize_selection(visible_len);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -302,7 +337,8 @@ impl App {
             _ => {}
         }
 
-        self.normalize_selection(self.visible_len());
+        let visible_len = self.visible_len();
+        self.normalize_selection(visible_len);
         false
     }
 }
@@ -383,8 +419,10 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title("Overview"));
     frame.render_widget(header, layout[0]);
 
-    let mid = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(layout[1]);
-    let charts = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(mid[1]);
+    let mid = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(layout[1]);
+    let charts =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(mid[1]);
 
     let mode = if app.paused { "paused" } else { "live" };
     let filter_display = app.active_filter();
@@ -443,13 +481,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::LightBlue));
     frame.render_widget(cpu_chart, charts[1]);
 
-    let visible = app.visible_indices();
-    app.normalize_selection(visible.len());
+    app.rebuild_visible_if_needed();
+    let visible_len = app.visible_indices.len();
+    app.normalize_selection(visible_len);
 
     let table_area = layout[2];
     let rows_visible = table_area.height.saturating_sub(3) as usize;
 
-    if rows_visible > 0 && !visible.is_empty() {
+    if rows_visible > 0 && visible_len > 0 {
         if app.selected < app.scroll {
             app.scroll = app.selected;
         }
@@ -460,12 +499,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         app.scroll = 0;
     }
 
-    let start = app.scroll.min(visible.len());
+    let start = app.scroll.min(visible_len);
     let end = if rows_visible == 0 {
         start
     } else {
-        (start + rows_visible).min(visible.len())
+        (start + rows_visible).min(visible_len)
     };
+
+    let visible = &app.visible_indices;
 
     let rows = visible[start..end].iter().map(|idx| {
         let r = &app.snapshot.rows[*idx];
@@ -520,11 +561,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
-    let refresh_state = if app.paused {
-        "paused"
-    } else {
-        "refreshing"
-    };
+    let refresh_state = if app.paused { "paused" } else { "refreshing" };
     let status_error = app
         .last_error
         .as_deref()
@@ -561,20 +598,23 @@ fn fetch_snapshot() -> io::Result<Snapshot> {
 }
 
 fn parse_second_sample(raw: &str) -> Vec<ProcRow> {
-    let lines: Vec<&str> = raw.lines().collect();
-    let start = lines
-        .iter()
-        .rposition(|line| line.trim_start().starts_with("PID"));
-
-    let Some(start_idx) = start else {
-        return Vec::new();
-    };
-
+    // Keep macOS top "second sample" semantics by resetting rows each time we hit a PID header.
     let mut rows = Vec::new();
+    let mut in_table = false;
 
-    for line in lines.iter().skip(start_idx + 1) {
+    for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("PID") {
+            rows.clear();
+            in_table = true;
+            continue;
+        }
+
+        if !in_table {
             continue;
         }
 
@@ -603,10 +643,12 @@ fn parse_row(line: &str) -> Option<ProcRow> {
     let mem = parts.get(parts.len().saturating_sub(2))?.to_string();
     let cpu = parts.get(parts.len().saturating_sub(3))?.to_string();
     let process = parts[1..parts.len().saturating_sub(3)].join(" ");
+    let process_lc = process.to_lowercase();
 
     Some(ProcRow {
         pid,
         process,
+        process_lc,
         cpu_num: parse_numeric_value(&cpu),
         mem_num: parse_mem_value(&mem),
         power_num: parse_numeric_value(&power),
