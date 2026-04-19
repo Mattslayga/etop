@@ -11,7 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 const TOP_BIN: &str = "top";
@@ -164,11 +164,164 @@ impl TopStreamParser {
     }
 }
 
+#[derive(Debug, Clone)]
+struct GraphHeatSettings {
+    yellow_start: f64,
+    orange_start: f64,
+    red_start: f64,
+}
+
+impl Default for GraphHeatSettings {
+    fn default() -> Self {
+        Self {
+            yellow_start: 40.0,
+            orange_start: 85.0,
+            red_start: 140.0,
+        }
+    }
+}
+
+impl GraphHeatSettings {
+    fn validate(&self) -> Result<(), String> {
+        let values = [self.yellow_start, self.orange_start, self.red_start];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("thresholds must be finite numbers >= 0".to_string());
+        }
+
+        if !(self.yellow_start < self.orange_start && self.orange_start < self.red_start) {
+            return Err("thresholds must satisfy yellow < orange < red".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn color_for_power(&self, power: f64) -> Color {
+        if power >= self.red_start {
+            COLOR_RED
+        } else if power >= self.orange_start {
+            COLOR_ORANGE
+        } else if power >= self.yellow_start {
+            COLOR_YELLOW
+        } else {
+            COLOR_GREEN
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AppSettings {
+    graph_heat: GraphHeatSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    YellowStart,
+    OrangeStart,
+    RedStart,
+}
+
+const SETTINGS_FIELDS: [SettingsField; 3] = [
+    SettingsField::YellowStart,
+    SettingsField::OrangeStart,
+    SettingsField::RedStart,
+];
+
+impl SettingsField {
+    fn label(self) -> &'static str {
+        match self {
+            SettingsField::YellowStart => "yellow start",
+            SettingsField::OrangeStart => "orange start",
+            SettingsField::RedStart => "red start",
+        }
+    }
+
+    fn value(self, settings: &AppSettings) -> f64 {
+        match self {
+            SettingsField::YellowStart => settings.graph_heat.yellow_start,
+            SettingsField::OrangeStart => settings.graph_heat.orange_start,
+            SettingsField::RedStart => settings.graph_heat.red_start,
+        }
+    }
+
+    fn set_value(self, settings: &mut AppSettings, value: f64) {
+        match self {
+            SettingsField::YellowStart => settings.graph_heat.yellow_start = value,
+            SettingsField::OrangeStart => settings.graph_heat.orange_start = value,
+            SettingsField::RedStart => settings.graph_heat.red_start = value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsEditState {
+    field: SettingsField,
+    buffer: String,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsModalState {
+    draft: AppSettings,
+    selected: usize,
+    editing: Option<SettingsEditState>,
+    error: Option<String>,
+}
+
+impl SettingsModalState {
+    fn new(current: &AppSettings) -> Self {
+        Self {
+            draft: current.clone(),
+            selected: 0,
+            editing: None,
+            error: None,
+        }
+    }
+
+    fn selected_field(&self) -> SettingsField {
+        SETTINGS_FIELDS[self.selected.min(SETTINGS_FIELDS.len().saturating_sub(1))]
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if SETTINGS_FIELDS.is_empty() {
+            self.selected = 0;
+            return;
+        }
+
+        let len = SETTINGS_FIELDS.len() as isize;
+        let current = self.selected as isize;
+        self.selected = (current + delta).rem_euclid(len) as usize;
+    }
+
+    fn start_edit(&mut self) {
+        let field = self.selected_field();
+        let value = field.value(&self.draft);
+        self.editing = Some(SettingsEditState {
+            field,
+            buffer: format_setting_value(value),
+        });
+        self.error = None;
+    }
+
+    fn display_value(&self, field: SettingsField) -> String {
+        if let Some(edit) = self.editing.as_ref() {
+            if edit.field == field {
+                return edit.buffer.clone();
+            }
+        }
+
+        format_setting_value(field.value(&self.draft))
+    }
+}
+
 struct App {
     snapshot: Snapshot,
     last_error: Option<String>,
     loading: bool,
     paused: bool,
+    settings: AppSettings,
+    settings_modal: Option<SettingsModalState>,
     pinned: Option<PinnedProcess>,
     selected: usize,
     scroll: usize,
@@ -186,6 +339,8 @@ impl App {
             last_error: None,
             loading: true,
             paused: false,
+            settings: AppSettings::default(),
+            settings_modal: None,
             pinned: None,
             selected: 0,
             scroll: 0,
@@ -337,6 +492,94 @@ impl App {
         }
     }
 
+    fn open_settings_modal(&mut self) {
+        self.settings_modal = Some(SettingsModalState::new(&self.settings));
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) {
+        let mut close_modal = false;
+        let mut apply_settings: Option<AppSettings> = None;
+
+        let Some(modal) = self.settings_modal.as_mut() else {
+            return;
+        };
+
+        if let Some(edit) = modal.editing.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    modal.editing = None;
+                    modal.error = None;
+                }
+                KeyCode::Enter => {
+                    let parsed = edit.buffer.trim().parse::<f64>();
+                    match parsed {
+                        Ok(value) if value.is_finite() && value >= 0.0 => {
+                            edit.field.set_value(&mut modal.draft, value);
+                            modal.editing = None;
+                            modal.error = None;
+                        }
+                        Ok(_) => {
+                            modal.error = Some("value must be a finite number >= 0".to_string());
+                        }
+                        Err(_) => {
+                            modal.error = Some("invalid number".to_string());
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    edit.buffer.pop();
+                    modal.error = None;
+                }
+                KeyCode::Char(ch)
+                    if ch.is_ascii_digit()
+                        || ch == '.'
+                        || (ch == '-' && edit.buffer.is_empty()) =>
+                {
+                    edit.buffer.push(ch);
+                    modal.error = None;
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => {
+                    close_modal = true;
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    match modal.draft.graph_heat.validate() {
+                        Ok(()) => {
+                            apply_settings = Some(modal.draft.clone());
+                            close_modal = true;
+                        }
+                        Err(err) => {
+                            modal.error = Some(err);
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    modal.move_selection(1);
+                    modal.error = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    modal.move_selection(-1);
+                    modal.error = None;
+                }
+                KeyCode::Enter => {
+                    modal.start_edit();
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(next_settings) = apply_settings {
+            self.settings = next_settings;
+        }
+
+        if close_modal {
+            self.settings_modal = None;
+        }
+    }
+
     fn start_filter_input(&mut self) {
         self.filter_input = Some(self.filter_query.clone());
         self.mark_visible_dirty();
@@ -418,17 +661,24 @@ impl App {
     }
 
     fn status_hint(&self) -> &'static str {
-        if self.filter_input.is_some() {
+        if self.settings_modal.is_some() {
+            "settings: Enter edit • t apply • Esc cancel"
+        } else if self.filter_input.is_some() {
             "filter edit: Enter apply • Esc cancel"
         } else if self.pinned.is_some() {
-            "Enter unpin • / filter • space pause • q quit"
+            "Enter unpin • t settings • / filter • space pause • q quit"
         } else {
-            "j/k move • Enter pin • / filter • space pause • q quit"
+            "j/k move • Enter pin • t settings • / filter • space pause • q quit"
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
+            return false;
+        }
+
+        if self.settings_modal.is_some() {
+            self.handle_settings_key(key);
             return false;
         }
 
@@ -445,6 +695,7 @@ impl App {
             KeyCode::Char('G') if !self.is_pinned() => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
             KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('t') | KeyCode::Char('T') => self.open_settings_modal(),
             KeyCode::Enter => self.toggle_pin(),
             _ => {}
         }
@@ -820,6 +1071,20 @@ fn panel_block() -> Block<'static> {
         .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
 }
 
+fn format_setting_value(value: f64) -> String {
+    let mut s = format!("{value:.1}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+
+    if s.is_empty() { "0".to_string() } else { s }
+}
+
 fn history_range(values: &[f64]) -> Option<(f64, f64)> {
     let mut iter = values.iter().copied();
     let first = iter.next()?;
@@ -887,16 +1152,8 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
     (normalized * max_steps as f64).round() as i32
 }
 
-fn spectrum_band_color(intensity: f64) -> Color {
-    if intensity < 0.45 {
-        COLOR_GREEN
-    } else if intensity < 0.70 {
-        COLOR_YELLOW
-    } else if intensity < 0.90 {
-        COLOR_ORANGE
-    } else {
-        COLOR_RED
-    }
+fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
+    thresholds.color_for_power(power)
 }
 
 fn graph_span_style(color: Option<Color>) -> Style {
@@ -923,8 +1180,6 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
-    let max_steps = (height * 4).max(1) as i32;
-
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
@@ -935,10 +1190,9 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         for col in 0..width {
             let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
             let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
-            let peak_step = (row_base + prev_level.max(curr_level) as i32).clamp(0, max_steps);
-            let intensity = (peak_step as f64 / max_steps as f64).clamp(0.0, 1.0);
+            let peak_power = samples[col].max(samples[col + 1]);
 
-            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], intensity));
+            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], peak_power));
         }
 
         rows.push(line);
@@ -947,7 +1201,12 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
     rows
 }
 
-fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
+fn braille_history_lines(
+    values: &[f64],
+    width: usize,
+    height: usize,
+    graph_heat: &GraphHeatSettings,
+) -> Vec<Line<'static>> {
     braille_history_cells(values, width, height)
         .into_iter()
         .map(|row| {
@@ -955,11 +1214,11 @@ fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Lin
             let mut run = String::new();
             let mut run_color: Option<Color> = None;
 
-            for (ch, intensity) in row {
+            for (ch, peak_power) in row {
                 let color = if ch == ' ' {
                     None
                 } else {
-                    Some(spectrum_band_color(intensity))
+                    Some(spectrum_band_color(peak_power, graph_heat))
                 };
 
                 if color != run_color && !run.is_empty() {
@@ -1131,6 +1390,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         &app.power_history,
         graph_rows[1].width as usize,
         graph_rows[1].height as usize,
+        &app.settings.graph_heat,
     );
 
     let graph = Paragraph::new(graph_lines)
@@ -1341,6 +1601,113 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, rows_area, &mut table_state);
+
+    if let Some(modal) = app.settings_modal.as_ref() {
+        draw_settings_modal(frame, modal);
+    }
+}
+
+fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - height_percent) / 2),
+        Constraint::Percentage(height_percent),
+        Constraint::Percentage((100 - height_percent) / 2),
+    ])
+    .split(area);
+
+    Layout::horizontal([
+        Constraint::Percentage((100 - width_percent) / 2),
+        Constraint::Percentage(width_percent),
+        Constraint::Percentage((100 - width_percent) / 2),
+    ])
+    .split(vertical[1])[1]
+}
+
+fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
+    let area = centered_rect(60, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = panel_block().title("Settings • t apply • Esc cancel");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Graph heat thresholds (absolute power)",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("", Style::default().fg(COLOR_MUTED))),
+    ];
+
+    for (idx, field) in SETTINGS_FIELDS.iter().enumerate() {
+        let is_selected = idx == modal.selected;
+        let is_editing = modal
+            .editing
+            .as_ref()
+            .map(|edit| edit.field == *field)
+            .unwrap_or(false);
+
+        let value = if is_editing {
+            format!("{}▏", modal.display_value(*field))
+        } else {
+            modal.display_value(*field)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<14}", field.label()),
+                if is_selected {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLOR_FG)
+                },
+            ),
+            Span::styled(" ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                value,
+                if is_editing {
+                    Style::default()
+                        .fg(COLOR_YELLOW)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_selected {
+                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLOR_FG)
+                },
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "",
+        Style::default().fg(COLOR_MUTED),
+    )));
+
+    if let Some(error) = modal.error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(COLOR_RED),
+        )));
+    } else if modal.editing.is_some() {
+        lines.push(Line::from(Span::styled(
+            "Enter confirm value • Esc cancel field edit",
+            Style::default().fg(COLOR_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "↑/↓ move • Enter edit field • t apply and close",
+            Style::default().fg(COLOR_MUTED),
+        )));
+    }
+
+    let content = Paragraph::new(lines)
+        .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(content, inner);
 }
 
 fn snapshot_from_rows(rows: Vec<ProcRow>) -> Snapshot {
@@ -1606,19 +1973,42 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn spectrum_band_color_uses_expected_breakpoints() {
-        assert_eq!(spectrum_band_color(0.10), COLOR_GREEN);
-        assert_eq!(spectrum_band_color(0.50), COLOR_YELLOW);
-        assert_eq!(spectrum_band_color(0.75), COLOR_ORANGE);
-        assert_eq!(spectrum_band_color(0.95), COLOR_RED);
+    fn graph_heat_settings_validate_requires_ordered_thresholds() {
+        let settings = GraphHeatSettings {
+            yellow_start: 80.0,
+            orange_start: 40.0,
+            red_start: 120.0,
+        };
+
+        assert!(settings.validate().is_err());
     }
 
     #[test]
-    fn braille_history_lines_color_high_values_use_orange_with_extra_headroom() {
-        let lines = braille_history_lines(&[0.0, 10.0], 1, 1);
+    fn spectrum_band_color_uses_absolute_breakpoints() {
+        let settings = GraphHeatSettings {
+            yellow_start: 20.0,
+            orange_start: 40.0,
+            red_start: 60.0,
+        };
+
+        assert_eq!(spectrum_band_color(10.0, &settings), COLOR_GREEN);
+        assert_eq!(spectrum_band_color(25.0, &settings), COLOR_YELLOW);
+        assert_eq!(spectrum_band_color(50.0, &settings), COLOR_ORANGE);
+        assert_eq!(spectrum_band_color(70.0, &settings), COLOR_RED);
+    }
+
+    #[test]
+    fn braille_history_lines_color_uses_absolute_thresholds() {
+        let thresholds = GraphHeatSettings {
+            yellow_start: 2.0,
+            orange_start: 5.0,
+            red_start: 8.0,
+        };
+
+        let lines = braille_history_lines(&[0.0, 10.0], 1, 1, &thresholds);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 1);
-        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_ORANGE));
+        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_RED));
     }
 
     #[test]
