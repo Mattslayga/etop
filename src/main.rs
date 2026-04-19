@@ -865,11 +865,13 @@ fn graph_scale_bounds(values: &[f64]) -> (f64, f64) {
     let span = (raw_max - raw_min).max(0.0);
     let target_span = (raw_max * 0.25).max(1.0);
 
-    let adjusted_max = if span < target_span {
+    let base_max = if span < target_span {
         raw_max + (target_span - span) * 0.5
     } else {
         raw_max
     };
+
+    let adjusted_max = (base_max * 1.35).max(raw_max + 5.0);
 
     (0.0, adjusted_max.max(1.0))
 }
@@ -1586,7 +1588,7 @@ PID COMMAND POWER
     #[test]
     fn braille_history_rows_single_row_uses_lookup_mapping() {
         let rows = braille_history_rows(&[0.0, 10.0], 1, 1);
-        assert_eq!(rows, vec!["⢸".to_string()]);
+        assert_eq!(rows, vec!["⢰".to_string()]);
     }
 
     #[test]
@@ -1612,16 +1614,22 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn braille_history_lines_color_high_values_red() {
+    fn braille_history_lines_color_high_values_use_orange_with_extra_headroom() {
         let lines = braille_history_lines(&[0.0, 10.0], 1, 1);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 1);
-        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_RED));
+        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_ORANGE));
     }
 
     #[test]
     fn graph_scale_bounds_adds_headroom_for_flat_history() {
         let (_, max) = graph_scale_bounds(&[5.0, 5.0, 5.0]);
         assert!(max > 5.0);
+    }
+
+    #[test]
+    fn graph_scale_bounds_adds_headroom_for_active_history() {
+        let (_, max) = graph_scale_bounds(&[39.3, 64.1, 118.8]);
+        assert!(max > 118.8);
     }
 }
