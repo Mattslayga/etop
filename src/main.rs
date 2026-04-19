@@ -556,7 +556,8 @@ fn history_range(values: &[f64]) -> Option<(f64, f64)> {
     Some((min, max))
 }
 
-fn resample_history(values: &[f64], points: usize) -> Vec<f64> {
+fn history_viewport_samples(values: &[f64], width: usize) -> Vec<f64> {
+    let points = width.saturating_add(1);
     if points == 0 {
         return Vec::new();
     }
@@ -565,33 +566,14 @@ fn resample_history(values: &[f64], points: usize) -> Vec<f64> {
         return vec![0.0; points];
     }
 
-    if values.len() == 1 {
-        return vec![values[0]; points];
+    if values.len() >= points {
+        return values[values.len() - points..].to_vec();
     }
 
-    if points == 1 {
-        return vec![*values.last().unwrap_or(&0.0)];
-    }
-
-    let mut sampled = Vec::with_capacity(points);
-    let max_index = (values.len() - 1) as f64;
-
-    for i in 0..points {
-        let t = i as f64 / (points - 1) as f64;
-        let pos = t * max_index;
-        let low = pos.floor() as usize;
-        let high = pos.ceil() as usize;
-
-        if low == high {
-            sampled.push(values[low]);
-            continue;
-        }
-
-        let frac = pos - low as f64;
-        sampled.push(values[low] + (values[high] - values[low]) * frac);
-    }
-
-    sampled
+    let mut samples = vec![0.0; points];
+    let start = points - values.len();
+    samples[start..].copy_from_slice(values);
+    samples
 }
 
 fn graph_scale_bounds(values: &[f64]) -> (f64, f64) {
@@ -633,7 +615,7 @@ fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<Stri
         return vec![String::new(); height];
     }
 
-    let samples = resample_history(values, width + 1);
+    let samples = history_viewport_samples(values, width);
     let (scale_min, scale_max) = graph_scale_bounds(&samples);
 
     let steps: Vec<i32> = samples
@@ -1132,6 +1114,28 @@ PID COMMAND POWER
     #[test]
     fn parse_row_rejects_missing_columns() {
         assert!(parse_row("123 onlypid").is_none());
+    }
+
+    #[test]
+    fn history_viewport_samples_keeps_latest_points_without_resampling() {
+        let samples = history_viewport_samples(&[1.0, 2.0, 3.0, 4.0, 5.0], 3);
+        assert_eq!(samples, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn history_viewport_samples_shifts_left_as_new_samples_arrive() {
+        let width = 3;
+        let before = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0], width);
+        let after = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0], width);
+
+        assert_eq!(&after[..width], &before[1..]);
+        assert_eq!(after[width], 4.0);
+    }
+
+    #[test]
+    fn history_viewport_samples_right_aligns_short_history() {
+        let samples = history_viewport_samples(&[7.0, 8.0], 4);
+        assert_eq!(samples, vec![0.0, 0.0, 0.0, 7.0, 8.0]);
     }
 
     #[test]
