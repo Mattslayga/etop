@@ -4,10 +4,12 @@ Local-only macOS TUI process viewer focused on power usage and energy impact.
 
 ## Data source
 
-`etop` keeps sample-primed macOS semantics:
+`etop` keeps macOS `top` power semantics:
 
-- `top -l 2 -s 0 -o power -stats pid,command,power`
-- Parses the **second** sample
+- Interactive TUI: long-lived stream from `top -l 0 -s 2 -o power -stats pid,command,power`
+  - skips the first emitted table as warmup
+- `--dump-once`: `top -l 2 -s 0 -o power -stats pid,command,power`
+  - parses the **second** sample
 
 ## UI
 

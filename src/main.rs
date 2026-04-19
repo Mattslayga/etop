@@ -1,10 +1,10 @@
 use std::{
     cmp::Ordering,
-    io,
-    process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    io::{self, BufRead, BufReader},
+    process::{Child, ChildStdout, Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -27,6 +27,9 @@ const TOP_ARGS: [&str; 8] = [
 ];
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
+const COLLECTOR_POLL_EVERY: Duration = Duration::from_millis(200);
+const SAMPLER_RESTART_BACKOFF: Duration = Duration::from_secs(1);
+const SAMPLER_QUEUE_CAPACITY: usize = 8;
 const HISTORY_LIMIT: usize = 240;
 
 const COLOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
@@ -74,6 +77,90 @@ enum CollectorCommand {
 enum CollectorEvent {
     Snapshot(Snapshot),
     Error(String),
+}
+
+#[derive(Debug)]
+enum SamplerEvent {
+    Snapshot(Snapshot),
+    Error(String),
+    Ended,
+}
+
+struct SamplerRuntime {
+    child: Child,
+    events: Receiver<SamplerEvent>,
+    reader: thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct TopStreamParser {
+    excluded_pids: Vec<i32>,
+    in_table: bool,
+    skipped_warmup: bool,
+    rows: Vec<ProcRow>,
+}
+
+impl TopStreamParser {
+    fn new(excluded_pids: Vec<i32>) -> Self {
+        Self {
+            excluded_pids,
+            in_table: false,
+            skipped_warmup: false,
+            rows: Vec::new(),
+        }
+    }
+
+    fn push_line(&mut self, line: &str) -> Result<Option<Snapshot>, String> {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("PID") {
+            let finished = self.finish_frame();
+            self.in_table = true;
+            return Ok(finished);
+        }
+
+        if !self.in_table {
+            return Ok(None);
+        }
+
+        if trimmed.is_empty() {
+            return Ok(self.finish_frame());
+        }
+
+        let first = trimmed.chars().next().unwrap_or(' ');
+        if !first.is_ascii_digit() {
+            return Ok(self.finish_frame());
+        }
+
+        let row =
+            parse_row(trimmed).ok_or_else(|| format!("unable to parse top row: {trimmed}"))?;
+
+        if !self.excluded_pids.contains(&row.pid) {
+            self.rows.push(row);
+        }
+
+        Ok(None)
+    }
+
+    fn finish_stream(&mut self) -> Option<Snapshot> {
+        self.finish_frame()
+    }
+
+    fn finish_frame(&mut self) -> Option<Snapshot> {
+        if !self.in_table {
+            return None;
+        }
+
+        self.in_table = false;
+        let rows = std::mem::take(&mut self.rows);
+
+        if !self.skipped_warmup {
+            self.skipped_warmup = true;
+            return None;
+        }
+
+        Some(snapshot_from_rows(rows))
+    }
 }
 
 struct App {
@@ -438,89 +525,280 @@ fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
 fn collector_loop(event_tx: Sender<CollectorEvent>, cmd_rx: Receiver<CollectorCommand>) {
     let mut paused = false;
-    let mut next_fetch_start = Instant::now();
+    let mut sampler: Option<SamplerRuntime> = None;
+    let self_pid = i32::try_from(std::process::id()).ok();
 
     loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
-                return;
-            }
+        if drain_collector_commands(&cmd_rx, &mut paused, &mut sampler) {
+            return;
         }
 
-        if paused {
-            match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+        if sampler.is_none() {
+            match start_sampler(self_pid) {
+                Ok(next_sampler) => sampler = Some(next_sampler),
+                Err(err) => {
+                    if event_tx
+                        .send(CollectorEvent::Error(format!(
+                            "sampler start failed: {err}"
+                        )))
+                        .is_err()
+                    {
                         return;
                     }
-                }
-                Err(_) => return,
-            }
-            continue;
-        }
 
-        let now = Instant::now();
-        if now < next_fetch_start {
-            let wait_for = next_fetch_start - now;
-            match cmd_rx.recv_timeout(wait_for) {
-                Ok(cmd) => {
-                    if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+                    if wait_for_restart_or_stop(&cmd_rx, &mut paused, &mut sampler) {
                         return;
                     }
+
                     continue;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
 
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            if handle_collector_command(cmd, &mut paused, &mut next_fetch_start) {
+        let sampler_events = match sampler.as_ref() {
+            Some(runtime) => &runtime.events,
+            None => continue,
+        };
+
+        match sampler_events.recv_timeout(COLLECTOR_POLL_EVERY) {
+            Ok(SamplerEvent::Snapshot(snapshot)) => {
+                if paused {
+                    continue;
+                }
+
+                if event_tx.send(CollectorEvent::Snapshot(snapshot)).is_err() {
+                    if let Some(runtime) = sampler.take() {
+                        shutdown_sampler(runtime);
+                    }
+                    return;
+                }
+            }
+            Ok(SamplerEvent::Error(err)) => {
+                if event_tx
+                    .send(CollectorEvent::Error(format!(
+                        "sampler stream failed: {err}"
+                    )))
+                    .is_err()
+                {
+                    if let Some(runtime) = sampler.take() {
+                        shutdown_sampler(runtime);
+                    }
+                    return;
+                }
+
+                if let Some(runtime) = sampler.take() {
+                    shutdown_sampler(runtime);
+                }
+
+                if wait_for_restart_or_stop(&cmd_rx, &mut paused, &mut sampler) {
+                    return;
+                }
+            }
+            Ok(SamplerEvent::Ended) => {
+                if event_tx
+                    .send(CollectorEvent::Error(
+                        "sampler process exited; restarting".to_string(),
+                    ))
+                    .is_err()
+                {
+                    if let Some(runtime) = sampler.take() {
+                        shutdown_sampler(runtime);
+                    }
+                    return;
+                }
+
+                if let Some(runtime) = sampler.take() {
+                    shutdown_sampler(runtime);
+                }
+
+                if wait_for_restart_or_stop(&cmd_rx, &mut paused, &mut sampler) {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if event_tx
+                    .send(CollectorEvent::Error(
+                        "sampler channel disconnected; restarting".to_string(),
+                    ))
+                    .is_err()
+                {
+                    if let Some(runtime) = sampler.take() {
+                        shutdown_sampler(runtime);
+                    }
+                    return;
+                }
+
+                if let Some(runtime) = sampler.take() {
+                    shutdown_sampler(runtime);
+                }
+
+                if wait_for_restart_or_stop(&cmd_rx, &mut paused, &mut sampler) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn start_sampler(self_pid: Option<i32>) -> io::Result<SamplerRuntime> {
+    let sample_seconds = REFRESH_EVERY.as_secs().max(1).to_string();
+    let mut child = Command::new(TOP_BIN)
+        .arg("-l")
+        .arg("0")
+        .arg("-s")
+        .arg(sample_seconds)
+        .arg("-o")
+        .arg("power")
+        .arg("-stats")
+        .arg("pid,command,power")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut excluded_pids = Vec::with_capacity(2);
+    if let Ok(top_pid) = i32::try_from(child.id()) {
+        excluded_pids.push(top_pid);
+    }
+    if let Some(pid) = self_pid {
+        excluded_pids.push(pid);
+    }
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("sampler stdout was not available"));
+        }
+    };
+
+    let (event_tx, event_rx) = mpsc::sync_channel::<SamplerEvent>(SAMPLER_QUEUE_CAPACITY);
+    let reader = thread::spawn(move || sampler_reader_loop(stdout, excluded_pids, event_tx));
+
+    Ok(SamplerRuntime {
+        child,
+        events: event_rx,
+        reader,
+    })
+}
+
+fn sampler_reader_loop(
+    stdout: ChildStdout,
+    excluded_pids: Vec<i32>,
+    event_tx: SyncSender<SamplerEvent>,
+) {
+    let mut parser = TopStreamParser::new(excluded_pids);
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Some(snapshot) = parser.finish_stream() {
+                    if event_tx.send(SamplerEvent::Snapshot(snapshot)).is_err() {
+                        return;
+                    }
+                }
+                let _ = event_tx.send(SamplerEvent::Ended);
+                return;
+            }
+            Ok(_) => match parser.push_line(&line) {
+                Ok(Some(snapshot)) => {
+                    if event_tx.send(SamplerEvent::Snapshot(snapshot)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = event_tx.send(SamplerEvent::Error(err));
+                    return;
+                }
+            },
+            Err(err) => {
+                let _ = event_tx.send(SamplerEvent::Error(format!(
+                    "failed reading top stream: {err}"
+                )));
                 return;
             }
         }
+    }
+}
 
-        if paused {
-            continue;
+fn wait_for_restart_or_stop(
+    cmd_rx: &Receiver<CollectorCommand>,
+    paused: &mut bool,
+    sampler: &mut Option<SamplerRuntime>,
+) -> bool {
+    match cmd_rx.recv_timeout(SAMPLER_RESTART_BACKOFF) {
+        Ok(cmd) => handle_collector_command(cmd, paused, sampler),
+        Err(RecvTimeoutError::Timeout) => false,
+        Err(RecvTimeoutError::Disconnected) => {
+            if let Some(runtime) = sampler.take() {
+                shutdown_sampler(runtime);
+            }
+            true
         }
+    }
+}
 
-        let fetch_started = Instant::now();
-        match fetch_snapshot() {
-            Ok(snapshot) => {
-                if event_tx.send(CollectorEvent::Snapshot(snapshot)).is_err() {
-                    return;
+fn drain_collector_commands(
+    cmd_rx: &Receiver<CollectorCommand>,
+    paused: &mut bool,
+    sampler: &mut Option<SamplerRuntime>,
+) -> bool {
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(cmd) => {
+                if handle_collector_command(cmd, paused, sampler) {
+                    return true;
                 }
             }
-            Err(err) => {
-                if event_tx
-                    .send(CollectorEvent::Error(err.to_string()))
-                    .is_err()
-                {
-                    return;
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                if let Some(runtime) = sampler.take() {
+                    shutdown_sampler(runtime);
                 }
+                return true;
             }
         }
-
-        next_fetch_start = fetch_started + REFRESH_EVERY;
     }
 }
 
 fn handle_collector_command(
     cmd: CollectorCommand,
     paused: &mut bool,
-    next_fetch_start: &mut Instant,
+    sampler: &mut Option<SamplerRuntime>,
 ) -> bool {
     match cmd {
         CollectorCommand::SetPaused(next) => {
-            let was_paused = *paused;
             *paused = next;
-            if was_paused && !*paused {
-                *next_fetch_start = Instant::now();
-            }
             false
         }
-        CollectorCommand::Stop => true,
+        CollectorCommand::Stop => {
+            if let Some(runtime) = sampler.take() {
+                shutdown_sampler(runtime);
+            }
+            true
+        }
     }
+}
+
+fn shutdown_sampler(mut sampler: SamplerRuntime) {
+    match sampler.child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = sampler.child.kill();
+            let _ = sampler.child.wait();
+        }
+        Err(_) => {
+            let _ = sampler.child.kill();
+            let _ = sampler.child.wait();
+        }
+    }
+
+    let _ = sampler.reader.join();
 }
 
 fn drain_collector_events(app: &mut App, event_rx: &Receiver<CollectorEvent>) {
@@ -998,6 +1276,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, rows_area, &mut table_state);
 }
 
+fn snapshot_from_rows(rows: Vec<ProcRow>) -> Snapshot {
+    let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
+    Snapshot { rows, total_power }
+}
+
 fn fetch_snapshot() -> io::Result<Snapshot> {
     let child = Command::new(TOP_BIN)
         .args(TOP_ARGS)
@@ -1024,9 +1307,7 @@ fn fetch_snapshot() -> io::Result<Snapshot> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let rows = parse_second_sample_excluding(&stdout, &excluded_pids);
-    let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
-
-    Ok(Snapshot { rows, total_power })
+    Ok(snapshot_from_rows(rows))
 }
 
 fn parse_second_sample_excluding(raw: &str, excluded_pids: &[i32]) -> Vec<ProcRow> {
@@ -1131,6 +1412,73 @@ PID COMMAND POWER
         let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
 
         assert_eq!(pids, vec![30]);
+    }
+
+    #[test]
+    fn top_stream_parser_skips_warmup_frame() {
+        let mut parser = TopStreamParser::new(vec![]);
+        let mut snapshots = Vec::new();
+
+        let lines = [
+            "PID COMMAND POWER",
+            "10 Safari 1.0",
+            "",
+            "PID COMMAND POWER",
+            "20 Finder 2.5",
+            "",
+        ];
+
+        for line in lines {
+            if let Some(snapshot) = parser.push_line(line).expect("stream line should parse") {
+                snapshots.push(snapshot);
+            }
+        }
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].rows.len(), 1);
+        assert_eq!(snapshots[0].rows[0].pid, 20);
+        assert!((snapshots[0].total_power - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn top_stream_parser_excludes_internal_pids() {
+        let mut parser = TopStreamParser::new(vec![30]);
+
+        parser
+            .push_line("PID COMMAND POWER")
+            .expect("header should parse");
+        parser
+            .push_line("10 warmup 0.1")
+            .expect("warmup row should parse");
+        parser.push_line("").expect("warmup end should parse");
+
+        parser
+            .push_line("PID COMMAND POWER")
+            .expect("header should parse");
+        parser
+            .push_line("30 top 7.0")
+            .expect("excluded row should parse");
+        let snapshot = parser
+            .push_line("31 Safari 1.0")
+            .expect("row should parse")
+            .or_else(|| parser.push_line("").expect("frame boundary should parse"))
+            .expect("second frame should emit");
+
+        let pids: Vec<i32> = snapshot.rows.iter().map(|row| row.pid).collect();
+        assert_eq!(pids, vec![31]);
+    }
+
+    #[test]
+    fn top_stream_parser_reports_row_parse_errors() {
+        let mut parser = TopStreamParser::new(vec![]);
+        parser
+            .push_line("PID COMMAND POWER")
+            .expect("header should parse");
+
+        let err = parser
+            .push_line("123")
+            .expect_err("malformed row should fail parsing");
+        assert!(err.contains("unable to parse top row"));
     }
 
     #[test]
