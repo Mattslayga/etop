@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     io,
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
     time::{Duration, Instant},
@@ -999,7 +999,21 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn fetch_snapshot() -> io::Result<Snapshot> {
-    let output = Command::new(TOP_BIN).args(TOP_ARGS).output()?;
+    let child = Command::new(TOP_BIN)
+        .args(TOP_ARGS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut excluded_pids = Vec::with_capacity(2);
+    if let Ok(top_pid) = i32::try_from(child.id()) {
+        excluded_pids.push(top_pid);
+    }
+    if let Ok(self_pid) = i32::try_from(std::process::id()) {
+        excluded_pids.push(self_pid);
+    }
+
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
@@ -1009,13 +1023,13 @@ fn fetch_snapshot() -> io::Result<Snapshot> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let rows = parse_second_sample(&stdout);
+    let rows = parse_second_sample_excluding(&stdout, &excluded_pids);
     let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
 
     Ok(Snapshot { rows, total_power })
 }
 
-fn parse_second_sample(raw: &str) -> Vec<ProcRow> {
+fn parse_second_sample_excluding(raw: &str, excluded_pids: &[i32]) -> Vec<ProcRow> {
     // Keep macOS top "second sample" semantics by resetting rows each time we hit a PID header.
     let mut rows = Vec::new();
     let mut in_table = false;
@@ -1042,6 +1056,9 @@ fn parse_second_sample(raw: &str) -> Vec<ProcRow> {
         }
 
         if let Some(row) = parse_row(trimmed) {
+            if excluded_pids.contains(&row.pid) {
+                continue;
+            }
             rows.push(row);
         }
     }
@@ -1094,11 +1111,26 @@ PID COMMAND POWER
 100 Google Chrome Helper 4.6
 "#;
 
-        let rows = parse_second_sample(raw);
+        let rows = parse_second_sample_excluding(raw, &[]);
         let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
 
         assert_eq!(pids, vec![99, 100]);
         assert_eq!(rows[1].process, "Google Chrome Helper");
+    }
+
+    #[test]
+    fn parse_second_sample_excludes_internal_pids() {
+        let raw = r#"
+PID COMMAND POWER
+10 etop 5.0
+20 top 3.0
+30 Safari 1.0
+"#;
+
+        let rows = parse_second_sample_excluding(raw, &[10, 20]);
+        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
+
+        assert_eq!(pids, vec![30]);
     }
 
     #[test]

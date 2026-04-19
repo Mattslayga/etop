@@ -57,4 +57,5 @@ Prints top rows once and exits.
 ## Notes
 
 - macOS only (`top -l` semantics)
+- Internal collector processes (`etop` and sampling `top`) are hidden by PID
 - No network calls; local command execution only
