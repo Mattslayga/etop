@@ -886,11 +886,11 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
 }
 
 fn spectrum_band_color(intensity: f64) -> Color {
-    if intensity < 0.30 {
+    if intensity < 0.45 {
         COLOR_GREEN
-    } else if intensity < 0.55 {
+    } else if intensity < 0.70 {
         COLOR_YELLOW
-    } else if intensity < 0.80 {
+    } else if intensity < 0.90 {
         COLOR_ORANGE
     } else {
         COLOR_RED
@@ -1606,9 +1606,9 @@ PID COMMAND POWER
     #[test]
     fn spectrum_band_color_uses_expected_breakpoints() {
         assert_eq!(spectrum_band_color(0.10), COLOR_GREEN);
-        assert_eq!(spectrum_band_color(0.40), COLOR_YELLOW);
-        assert_eq!(spectrum_band_color(0.65), COLOR_ORANGE);
-        assert_eq!(spectrum_band_color(0.90), COLOR_RED);
+        assert_eq!(spectrum_band_color(0.50), COLOR_YELLOW);
+        assert_eq!(spectrum_band_color(0.75), COLOR_ORANGE);
+        assert_eq!(spectrum_band_color(0.95), COLOR_RED);
     }
 
     #[test]
