@@ -594,30 +594,70 @@ fn resample_history(values: &[f64], points: usize) -> Vec<f64> {
     sampled
 }
 
-fn quantize_level(value: f64, min: f64, max: f64) -> usize {
-    if (max - min).abs() < f64::EPSILON {
-        return if value <= 0.0 { 0 } else { 4 };
+fn graph_scale_bounds(values: &[f64]) -> (f64, f64) {
+    let (raw_min, raw_max) = history_range(values).unwrap_or((0.0, 0.0));
+
+    if raw_max <= 0.0 {
+        return (0.0, 1.0);
     }
 
-    (((value - min) * 4.0 / (max - min)).round()).clamp(0.0, 4.0) as usize
+    let span = (raw_max - raw_min).max(0.0);
+    let target_span = (raw_max * 0.25).max(1.0);
+
+    let adjusted_max = if span < target_span {
+        raw_max + (target_span - span) * 0.5
+    } else {
+        raw_max
+    };
+
+    (0.0, adjusted_max.max(1.0))
 }
 
-fn braille_history_line(values: &[f64], width: usize) -> String {
+fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
+    if rows == 0 || max <= min {
+        return 0;
+    }
+
+    let max_steps = (rows * 4) as i32;
+    let normalized = ((value - min) / (max - min)).clamp(0.0, 1.0);
+
+    (normalized * max_steps as f64).round() as i32
+}
+
+fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+
     if width == 0 {
-        return String::new();
+        return vec![String::new(); height];
     }
 
     let samples = resample_history(values, width + 1);
-    let (min, max) = history_range(&samples).unwrap_or((0.0, 0.0));
+    let (scale_min, scale_max) = graph_scale_bounds(&samples);
 
-    let mut line = String::with_capacity(width * 3);
-    for pair in samples.windows(2).take(width) {
-        let prev_level = quantize_level(pair[0], min, max);
-        let curr_level = quantize_level(pair[1], min, max);
-        line.push(BRAILLE_5X5[prev_level * 5 + curr_level]);
+    let steps: Vec<i32> = samples
+        .iter()
+        .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
+        .collect();
+
+    let mut rows = Vec::with_capacity(height);
+
+    for row_from_top in 0..height {
+        let row_from_bottom = height - 1 - row_from_top;
+        let row_base = (row_from_bottom * 4) as i32;
+
+        let mut line = String::with_capacity(width * 3);
+        for col in 0..width {
+            let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
+            let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
+            line.push(BRAILLE_5X5[prev_level * 5 + curr_level]);
+        }
+
+        rows.push(line);
     }
 
-    line
+    rows
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
@@ -757,8 +797,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     ]));
     frame.render_widget(graph_label, graph_rows[0]);
 
-    let graph_line = braille_history_line(&app.power_history, graph_rows[1].width as usize);
-    let graph = Paragraph::new(graph_line)
+    let graph_lines: Vec<Line> = braille_history_rows(
+        &app.power_history,
+        graph_rows[1].width as usize,
+        graph_rows[1].height as usize,
+    )
+    .into_iter()
+    .map(Line::from)
+    .collect();
+
+    let graph = Paragraph::new(graph_lines)
         .style(Style::default().fg(COLOR_RED).bg(COLOR_BG))
         .wrap(Wrap { trim: false });
     frame.render_widget(graph, graph_rows[1]);
@@ -1087,14 +1135,28 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn braille_history_line_uses_lookup_mapping() {
-        let line = braille_history_line(&[0.0, 10.0], 1);
-        assert_eq!(line, "⢸");
+    fn braille_history_rows_single_row_uses_lookup_mapping() {
+        let rows = braille_history_rows(&[0.0, 10.0], 1, 1);
+        assert_eq!(rows, vec!["⢸".to_string()]);
     }
 
     #[test]
-    fn braille_history_line_defaults_to_blanks_when_empty() {
-        let line = braille_history_line(&[], 4);
-        assert_eq!(line, "    ");
+    fn braille_history_rows_respects_requested_dimensions() {
+        let rows = braille_history_rows(&[0.0, 5.0, 10.0], 6, 3);
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.chars().count() == 6));
+    }
+
+    #[test]
+    fn braille_history_rows_defaults_to_blanks_when_empty() {
+        let rows = braille_history_rows(&[], 4, 2);
+        assert_eq!(rows, vec!["    ".to_string(), "    ".to_string()]);
+    }
+
+    #[test]
+    fn graph_scale_bounds_adds_headroom_for_flat_history() {
+        let (_, max) = graph_scale_bounds(&[5.0, 5.0, 5.0]);
+        assert!(max > 5.0);
     }
 }
