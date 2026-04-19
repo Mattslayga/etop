@@ -1367,7 +1367,10 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let graph_rows =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(graph_inner);
 
-    let (history_min, history_max) = history_range(&app.power_history).unwrap_or((0.0, 0.0));
+    let graph_width = graph_rows[1].width as usize;
+    let graph_height = graph_rows[1].height as usize;
+    let graph_samples = history_viewport_samples(&app.power_history, graph_width);
+    let (scale_min, scale_max) = graph_scale_bounds(&graph_samples);
     let graph_label = Paragraph::new(Line::from(vec![
         Span::styled("POWER ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
@@ -1378,18 +1381,19 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             format!(
                 "  • {} points  • range {:.1}–{:.1}",
                 app.power_history.len(),
-                history_min,
-                history_max
+                scale_min,
+                scale_max
             ),
             Style::default().fg(COLOR_MUTED),
         ),
     ]));
+    debug_assert!(graph_height > 0 || graph_width == 0);
     frame.render_widget(graph_label, graph_rows[0]);
 
     let graph_lines = braille_history_lines(
         &app.power_history,
-        graph_rows[1].width as usize,
-        graph_rows[1].height as usize,
+        graph_width,
+        graph_height,
         &app.settings.graph_heat,
     );
 
