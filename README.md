@@ -16,7 +16,7 @@ Local-only macOS TUI process viewer focused on power usage and energy impact.
 OneDark-inspired multi-pane layout:
 
 - Thin single-line status strip (mode, load, rows, power, filter, pinned PID when active)
-- Aggregate **multi-row braille-style** power history area (roughly top third), rendered as a rolling right-edge trace
+- Aggregate **multi-row braille-style** power history area (roughly top third), rendered as a rolling right-edge trace with green→yellow→orange→red intensity bands
 - Process table area (roughly bottom two thirds)
 - Optional pinned-process detail pane that opens above rows within the table region
 - Details are locked to the pinned PID/process until unpinned

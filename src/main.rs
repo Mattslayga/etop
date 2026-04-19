@@ -39,6 +39,7 @@ const COLOR_MUTED: Color = Color::Rgb(0x5c, 0x63, 0x70);
 const COLOR_SELECTED_BG: Color = Color::Rgb(0x2c, 0x31, 0x3c);
 const COLOR_GREEN: Color = Color::Rgb(0x98, 0xc3, 0x79);
 const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
+const COLOR_ORANGE: Color = Color::Rgb(0xd1, 0x9a, 0x66);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 
 const BRAILLE_5X5: [char; 25] = [
@@ -884,13 +885,32 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
     (normalized * max_steps as f64).round() as i32
 }
 
-fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<String> {
+fn spectrum_band_color(intensity: f64) -> Color {
+    if intensity < 0.30 {
+        COLOR_GREEN
+    } else if intensity < 0.55 {
+        COLOR_YELLOW
+    } else if intensity < 0.80 {
+        COLOR_ORANGE
+    } else {
+        COLOR_RED
+    }
+}
+
+fn graph_span_style(color: Option<Color>) -> Style {
+    match color {
+        Some(color) => Style::default().fg(color).bg(COLOR_BG),
+        None => Style::default().fg(COLOR_BG).bg(COLOR_BG),
+    }
+}
+
+fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, f64)>> {
     if height == 0 {
         return Vec::new();
     }
 
     if width == 0 {
-        return vec![String::new(); height];
+        return vec![Vec::new(); height];
     }
 
     let samples = history_viewport_samples(values, width);
@@ -901,23 +921,71 @@ fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<Stri
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
+    let max_steps = (height * 4).max(1) as i32;
+
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
         let row_from_bottom = height - 1 - row_from_top;
         let row_base = (row_from_bottom * 4) as i32;
 
-        let mut line = String::with_capacity(width * 3);
+        let mut line = Vec::with_capacity(width);
         for col in 0..width {
             let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
             let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
-            line.push(BRAILLE_5X5[prev_level * 5 + curr_level]);
+            let peak_step = (row_base + prev_level.max(curr_level) as i32).clamp(0, max_steps);
+            let intensity = (peak_step as f64 / max_steps as f64).clamp(0.0, 1.0);
+
+            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], intensity));
         }
 
         rows.push(line);
     }
 
     rows
+}
+
+fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
+    braille_history_cells(values, width, height)
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            let mut run_color: Option<Color> = None;
+
+            for (ch, intensity) in row {
+                let color = if ch == ' ' {
+                    None
+                } else {
+                    Some(spectrum_band_color(intensity))
+                };
+
+                if color != run_color && !run.is_empty() {
+                    spans.push(Span::styled(
+                        std::mem::take(&mut run),
+                        graph_span_style(run_color),
+                    ));
+                }
+
+                run.push(ch);
+                run_color = color;
+            }
+
+            if !run.is_empty() {
+                spans.push(Span::styled(run, graph_span_style(run_color)));
+            }
+
+            Line::from(spans)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<String> {
+    braille_history_cells(values, width, height)
+        .into_iter()
+        .map(|row| row.into_iter().map(|(ch, _)| ch).collect())
+        .collect()
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
@@ -1057,17 +1125,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     ]));
     frame.render_widget(graph_label, graph_rows[0]);
 
-    let graph_lines: Vec<Line> = braille_history_rows(
+    let graph_lines = braille_history_lines(
         &app.power_history,
         graph_rows[1].width as usize,
         graph_rows[1].height as usize,
-    )
-    .into_iter()
-    .map(Line::from)
-    .collect();
+    );
 
     let graph = Paragraph::new(graph_lines)
-        .style(Style::default().fg(COLOR_RED).bg(COLOR_BG))
+        .style(Style::default().bg(COLOR_BG))
         .wrap(Wrap { trim: false });
     frame.render_widget(graph, graph_rows[1]);
 
@@ -1536,6 +1601,22 @@ PID COMMAND POWER
     fn braille_history_rows_defaults_to_blanks_when_empty() {
         let rows = braille_history_rows(&[], 4, 2);
         assert_eq!(rows, vec!["    ".to_string(), "    ".to_string()]);
+    }
+
+    #[test]
+    fn spectrum_band_color_uses_expected_breakpoints() {
+        assert_eq!(spectrum_band_color(0.10), COLOR_GREEN);
+        assert_eq!(spectrum_band_color(0.40), COLOR_YELLOW);
+        assert_eq!(spectrum_band_color(0.65), COLOR_ORANGE);
+        assert_eq!(spectrum_band_color(0.90), COLOR_RED);
+    }
+
+    #[test]
+    fn braille_history_lines_color_high_values_red() {
+        let lines = braille_history_lines(&[0.0, 10.0], 1, 1);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_RED));
     }
 
     #[test]
