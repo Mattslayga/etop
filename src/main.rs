@@ -1163,6 +1163,15 @@ fn graph_span_style(color: Option<Color>) -> Style {
     }
 }
 
+fn step_to_power(step: i32, min: f64, max: f64, max_steps: i32) -> f64 {
+    if max_steps <= 0 || max <= min {
+        return min;
+    }
+
+    let normalized = (step as f64 / max_steps as f64).clamp(0.0, 1.0);
+    min + normalized * (max - min)
+}
+
 fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, f64)>> {
     if height == 0 {
         return Vec::new();
@@ -1180,6 +1189,8 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
+    let max_steps = (height * 4) as i32;
+
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
@@ -1190,9 +1201,10 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         for col in 0..width {
             let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
             let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
-            let peak_power = samples[col].max(samples[col + 1]);
+            let segment_step = (row_base + prev_level.max(curr_level) as i32).clamp(0, max_steps);
+            let segment_power = step_to_power(segment_step, scale_min, scale_max, max_steps);
 
-            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], peak_power));
+            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], segment_power));
         }
 
         rows.push(line);
@@ -2013,6 +2025,37 @@ PID COMMAND POWER
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 1);
         assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_RED));
+    }
+
+    #[test]
+    fn braille_history_lines_do_not_flood_hot_colors_to_baseline() {
+        let thresholds = GraphHeatSettings {
+            yellow_start: 20.0,
+            orange_start: 40.0,
+            red_start: 60.0,
+        };
+
+        let lines = braille_history_lines(&[80.0, 80.0], 1, 8, &thresholds);
+
+        let occupied_colors: Vec<Color> = lines
+            .iter()
+            .filter_map(|line| {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    line.spans.first().and_then(|span| span.style.fg)
+                }
+            })
+            .collect();
+
+        assert!(occupied_colors.len() >= 3);
+        assert_eq!(occupied_colors.first().copied(), Some(COLOR_RED));
+        assert_eq!(occupied_colors.last().copied(), Some(COLOR_GREEN));
     }
 
     #[test]
