@@ -698,9 +698,9 @@ impl App {
         } else if self.filter_input.is_some() {
             "filter edit: Enter apply • Esc cancel"
         } else if self.pinned.is_some() {
-            "Enter unpin • m menu • / filter • 1 graph • space pause • q quit"
+            "Enter unpin • m menu • / filter • space pause • q quit"
         } else {
-            "j/k move • Enter pin • m menu • / filter • 1 graph • 2 table • space pause • q quit"
+            "j/k move • Enter pin • m menu • / filter • space pause • q quit"
         }
     }
 
@@ -1106,6 +1106,92 @@ fn panel_block() -> Block<'static> {
         .style(Style::default().fg(COLOR_FG))
 }
 
+fn chip_line(label: &str, hotkey: Option<char>) -> Vec<Span<'static>> {
+    let label_style = Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    let Some(hotkey) = hotkey else {
+        return vec![Span::styled(label.to_string(), label_style)];
+    };
+
+    let lower = hotkey.to_ascii_lowercase();
+    let upper = hotkey.to_ascii_uppercase();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut highlighted = false;
+
+    for ch in label.chars() {
+        if !highlighted && (ch == lower || ch == upper) {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), label_style));
+            }
+            spans.push(Span::styled(ch.to_string(), key_style));
+            highlighted = true;
+        } else {
+            buf.push(ch);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, label_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(label.to_string(), label_style));
+    }
+    spans
+}
+
+fn draw_chips_on_border(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    start_x: u16,
+    chips: &[Vec<Span<'_>>],
+) -> u16 {
+    let cap_style = Style::default().fg(COLOR_MUTED);
+    let left_cap = "┤";
+    let right_cap = "├";
+
+    if y < area.y || y >= area.y + area.height {
+        return start_x;
+    }
+
+    let mut x = start_x;
+    let right_edge = area.x + area.width.saturating_sub(1);
+
+    for chip in chips {
+        let inner_width: u16 = chip
+            .iter()
+            .map(|span| span.content.chars().count() as u16)
+            .sum();
+        let chip_width = inner_width + 2; // caps on each side
+        if x + chip_width > right_edge {
+            break;
+        }
+
+        buf[(x, y)].set_symbol(left_cap).set_style(cap_style);
+        x += 1;
+
+        for span in chip {
+            for ch in span.content.chars() {
+                if x >= right_edge {
+                    break;
+                }
+                let mut tmp = [0u8; 4];
+                let s = ch.encode_utf8(&mut tmp);
+                buf[(x, y)].set_symbol(s).set_style(span.style);
+                x += 1;
+            }
+        }
+
+        buf[(x, y)].set_symbol(right_cap).set_style(cap_style);
+        x += 1;
+    }
+
+    x
+}
+
 fn hotkey_hint_line(hint: &str) -> Line<'static> {
     let key_style = Style::default()
         .fg(COLOR_ACCENT)
@@ -1435,17 +1521,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         let graph_samples = history_viewport_samples(&app.power_history, graph_width);
         let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
 
-        let graph_title_left = Line::from(vec![
-            Span::styled(
-                "¹ etop ",
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(mode, mode_style),
-            Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(load_state, load_style),
-        ]);
         let graph_title_right = Line::from(vec![
             Span::styled("power ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
@@ -1464,8 +1539,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         ])
         .right_aligned();
 
-        let mut graph_bottom_spans =
-            hotkey_hint_line("space pause • m menu • 2 table").spans;
+        let mut graph_bottom_spans = hotkey_hint_line("space pause • m menu").spans;
         if let Some(error) = app.last_error.as_deref() {
             graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
             graph_bottom_spans.push(Span::styled(
@@ -1474,10 +1548,35 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             ));
         }
         let graph_block = panel_block()
-            .title_top(graph_title_left)
             .title_top(graph_title_right)
             .title_bottom(Line::from(graph_bottom_spans));
         frame.render_widget(graph_block, graph_area);
+
+        let graph_chips = vec![
+            chip_line("1etop", Some('1')),
+            {
+                let mut spans = chip_line(mode, None);
+                for span in &mut spans {
+                    span.style = span.style.patch(mode_style);
+                }
+                spans
+            },
+            {
+                let mut spans = chip_line(load_state, None);
+                for span in &mut spans {
+                    span.style = span.style.patch(load_style);
+                }
+                spans
+            },
+        ];
+        let border_y = graph_area.y;
+        draw_chips_on_border(
+            frame.buffer_mut(),
+            graph_area,
+            border_y,
+            graph_area.x + 1,
+            &graph_chips,
+        );
 
         debug_assert!(graph_height > 0 || graph_width == 0);
         let graph_lines = braille_history_lines_with_scale(
@@ -1680,22 +1779,22 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .map(|pin| format!(" • pinned pid {}", pin.pid))
         .unwrap_or_default();
 
-    let table_title = if app.filter_input.is_some() {
+    let table_title_right = if app.filter_input.is_some() {
         format!(
-            "² processes {visible_len}/{} • filter edit: {}{}",
+            "{visible_len}/{} • filter edit: {}{}",
             app.snapshot.rows.len(),
             app.active_filter(),
             pin_suffix,
         )
     } else if app.filter_query.is_empty() {
         format!(
-            "² processes {visible_len}/{} • power ↓{}",
+            "{visible_len}/{} • power ↓{}",
             app.snapshot.rows.len(),
             pin_suffix,
         )
     } else {
         format!(
-            "² processes {visible_len}/{} • power ↓ • filter: {}{}",
+            "{visible_len}/{} • power ↓ • filter: {}{}",
             app.snapshot.rows.len(),
             app.filter_query,
             pin_suffix,
@@ -1711,7 +1810,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let table_block = panel_block()
-        .title_top(table_title)
+        .title_top(Line::from(Span::styled(table_title_right, Style::default().fg(COLOR_MUTED))).right_aligned())
         .title_bottom(hotkey_hint_line(app.status_hint()));
 
     let table = Table::new(
@@ -1735,6 +1834,15 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, rows_area, &mut table_state);
+
+    let table_chips = vec![chip_line("2processes", Some('2'))];
+    draw_chips_on_border(
+        frame.buffer_mut(),
+        rows_area,
+        rows_area.y,
+        rows_area.x + 1,
+        &table_chips,
+    );
 
     if let Some(modal) = app.settings_modal.as_ref() {
         draw_settings_modal(frame, modal);
