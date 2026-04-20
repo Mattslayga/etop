@@ -67,6 +67,12 @@ struct PinnedProcess {
     process: String,
 }
 
+#[derive(Debug, Clone)]
+struct PinnedHistory {
+    pid: i32,
+    samples: Vec<f64>,
+}
+
 #[derive(Debug)]
 enum CollectorCommand {
     SetPaused(bool),
@@ -322,6 +328,7 @@ struct App {
     settings: AppSettings,
     settings_modal: Option<SettingsModalState>,
     pinned: Option<PinnedProcess>,
+    pinned_history: Option<PinnedHistory>,
     selected: usize,
     scroll: usize,
     filter_query: String,
@@ -341,6 +348,7 @@ impl App {
             settings: AppSettings::default(),
             settings_modal: None,
             pinned: None,
+            pinned_history: None,
             selected: 0,
             scroll: 0,
             filter_query: String::new(),
@@ -434,6 +442,23 @@ impl App {
             let extra = self.power_history.len() - HISTORY_LIMIT;
             self.power_history.drain(0..extra);
         }
+
+        if let Some(history) = self.pinned_history.as_mut() {
+            let pid = history.pid;
+            let current_power = self
+                .snapshot
+                .rows
+                .iter()
+                .find(|row| row.pid == pid)
+                .map(|row| row.power_num)
+                .unwrap_or(0.0);
+            history.samples.push(current_power);
+
+            if history.samples.len() > HISTORY_LIMIT {
+                let extra = history.samples.len() - HISTORY_LIMIT;
+                history.samples.drain(0..extra);
+            }
+        }
     }
 
     fn graph_scale_bounds_for_viewport(&self, samples: &[f64]) -> (f64, f64) {
@@ -479,6 +504,7 @@ impl App {
     fn toggle_pin(&mut self) {
         if self.pinned.is_some() {
             self.pinned = None;
+            self.pinned_history = None;
             return;
         }
 
@@ -491,6 +517,10 @@ impl App {
             self.pinned = Some(PinnedProcess {
                 pid: row.pid,
                 process: row.process.clone(),
+            });
+            self.pinned_history = Some(PinnedHistory {
+                pid: row.pid,
+                samples: vec![row.power_num],
             });
         }
     }
@@ -1452,7 +1482,17 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     if let Some(detail_rect) = detail_area {
-        let detail_lines = match (pinned.as_ref(), pinned_row.as_ref()) {
+        let detail_title = if let Some(pin) = pinned.as_ref() {
+            format!("³ pinned {} • Enter unpin", pin.pid)
+        } else {
+            "³ pinned process".to_string()
+        };
+
+        let detail_block = panel_block().title_top(detail_title);
+        let detail_inner = detail_block.inner(detail_rect);
+        frame.render_widget(detail_block, detail_rect);
+
+        let text_lines: Vec<Line> = match (pinned.as_ref(), pinned_row.as_ref()) {
             (Some(_), Some(row)) => {
                 let power_share = if app.snapshot.total_power > 0.0 {
                     (row.power_num / app.snapshot.total_power) * 100.0
@@ -1472,26 +1512,20 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                     Line::from(vec![
                         Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
                         Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled("  pwr ", Style::default().fg(COLOR_MUTED)),
                         Span::styled(
                             row.power.clone(),
                             Style::default()
                                 .fg(spectrum_band_color(row.power_num, &app.settings.graph_heat))
                                 .add_modifier(Modifier::BOLD),
                         ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("rank ", Style::default().fg(COLOR_MUTED)),
-                        Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("share ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
                         Span::styled(
-                            format!("{power_share:.1}% of total"),
-                            Style::default().fg(COLOR_RED),
+                            format!("{power_share:.1}%"),
+                            Style::default().fg(COLOR_FG),
                         ),
+                        Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
+                        Span::styled(rank_text, Style::default().fg(COLOR_FG)),
                     ]),
                 ]
             }
@@ -1504,24 +1538,48 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                     "Not present in the latest top sample.",
                     Style::default().fg(COLOR_MUTED),
                 )),
-                Line::from(Span::styled(
-                    "Process may have exited or changed state.",
-                    Style::default().fg(COLOR_MUTED),
-                )),
             ],
             _ => vec![],
         };
 
-        let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("³ pinned {} • Enter unpin", pin.pid)
+        let text_height = text_lines.len() as u16;
+        let text_rect = Rect {
+            x: detail_inner.x,
+            y: detail_inner.y,
+            width: detail_inner.width,
+            height: text_height.min(detail_inner.height),
+        };
+        frame.render_widget(Paragraph::new(text_lines), text_rect);
+
+        let mini_graph_rect = if detail_inner.height > text_height {
+            Some(Rect {
+                x: detail_inner.x,
+                y: detail_inner.y + text_height,
+                width: detail_inner.width,
+                height: detail_inner.height - text_height,
+            })
         } else {
-            "³ pinned process".to_string()
+            None
         };
 
-        let detail = Paragraph::new(detail_lines)
-            .block(panel_block().title_top(detail_title))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(detail, detail_rect);
+        if let (Some(graph_rect), Some(history)) =
+            (mini_graph_rect, app.pinned_history.as_ref())
+        {
+            let graph_w = graph_rect.width as usize;
+            let graph_h = graph_rect.height as usize;
+            if graph_w > 0 && graph_h > 0 {
+                let samples = history_viewport_samples(&history.samples, graph_w);
+                let (mini_min, mini_max) = graph_scale_bounds(&samples);
+                let mini_lines = braille_history_lines_with_scale(
+                    &history.samples,
+                    graph_w,
+                    graph_h,
+                    mini_min,
+                    mini_max,
+                );
+                frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+            }
+        }
     }
 
     let rows_visible = rows_area.height.saturating_sub(3) as usize;
