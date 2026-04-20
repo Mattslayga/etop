@@ -692,15 +692,25 @@ impl App {
         }
     }
 
-    fn status_hint(&self) -> &'static str {
+    fn status_hint_text(&self) -> &'static str {
         if self.settings_modal.is_some() {
-            "settings: Enter edit • m apply • Esc cancel"
+            "Enter edit • Esc cancel"
         } else if self.filter_input.is_some() {
-            "filter edit: Enter apply • Esc cancel"
+            "Enter apply • Esc cancel"
         } else if self.pinned.is_some() {
-            "Enter unpin • m menu • / filter • space pause • q quit"
+            "Enter unpin • space pause"
         } else {
-            "j/k move • Enter pin • m menu • / filter • space pause • q quit"
+            "j/k move • Enter pin • space pause"
+        }
+    }
+
+    fn status_hint_chips(&self) -> Vec<(&'static str, char)> {
+        if self.settings_modal.is_some() {
+            vec![("menu", 'm')]
+        } else if self.filter_input.is_some() {
+            vec![]
+        } else {
+            vec![("menu", 'm'), ("filter", 'f'), ("quit", 'q')]
         }
     }
 
@@ -1539,7 +1549,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         ])
         .right_aligned();
 
-        let mut graph_bottom_spans = hotkey_hint_line("space pause • m menu").spans;
+        let mut graph_bottom_spans = hotkey_hint_line("space pause").spans;
         if let Some(error) = app.last_error.as_deref() {
             graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
             graph_bottom_spans.push(Span::styled(
@@ -1549,7 +1559,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         }
         let graph_block = panel_block()
             .title_top(graph_title_right)
-            .title_bottom(Line::from(graph_bottom_spans));
+            .title_bottom(Line::from(graph_bottom_spans).right_aligned());
         frame.render_widget(graph_block, graph_area);
 
         let graph_chips = vec![
@@ -1576,6 +1586,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             border_y,
             graph_area.x + 1,
             &graph_chips,
+        );
+
+        let graph_bottom_chips = vec![chip_line("menu", Some('m'))];
+        let bottom_y = graph_area.y + graph_area.height.saturating_sub(1);
+        draw_chips_on_border(
+            frame.buffer_mut(),
+            graph_area,
+            bottom_y,
+            graph_area.x + 1,
+            &graph_bottom_chips,
         );
 
         debug_assert!(graph_height > 0 || graph_width == 0);
@@ -1617,12 +1637,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     if let Some(detail_rect) = detail_area {
         let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("pinned {} • Enter unpin", pin.pid)
+            format!("pinned {}", pin.pid)
         } else {
             "pinned process".to_string()
         };
 
-        let detail_block = panel_block().title_top(detail_title);
+        let detail_block = panel_block()
+            .title_top(detail_title)
+            .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
         let detail_inner = detail_block.inner(detail_rect);
         frame.render_widget(detail_block, detail_rect);
 
@@ -1810,8 +1832,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let table_block = panel_block()
-        .title_top(Line::from(Span::styled(table_title_right, Style::default().fg(COLOR_MUTED))).right_aligned())
-        .title_bottom(hotkey_hint_line(app.status_hint()));
+        .title_top(
+            Line::from(Span::styled(
+                table_title_right,
+                Style::default().fg(COLOR_MUTED),
+            ))
+            .right_aligned(),
+        )
+        .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
 
     let table = Table::new(
         rows,
@@ -1844,6 +1872,22 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         &table_chips,
     );
 
+    let bottom_chips: Vec<Vec<Span<'static>>> = app
+        .status_hint_chips()
+        .into_iter()
+        .map(|(label, hotkey)| chip_line(label, Some(hotkey)))
+        .collect();
+    if !bottom_chips.is_empty() {
+        let bottom_y = rows_area.y + rows_area.height.saturating_sub(1);
+        draw_chips_on_border(
+            frame.buffer_mut(),
+            rows_area,
+            bottom_y,
+            rows_area.x + 1,
+            &bottom_chips,
+        );
+    }
+
     if let Some(modal) = app.settings_modal.as_ref() {
         draw_settings_modal(frame, modal);
     }
@@ -1867,10 +1911,12 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 
 fn draw_easter_egg(frame: &mut Frame, area: Rect, tick: u64) {
     let block = panel_block()
-        .title_top("etop")
-        .title_bottom(hotkey_hint_line("1 graph • 2 table • q quit"));
+        .title_bottom(hotkey_hint_line("1 graph • 2 table • q quit").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let chips = vec![chip_line("etop", None)];
+    draw_chips_on_border(frame.buffer_mut(), area, area.y, area.x + 1, &chips);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -1919,9 +1965,13 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
 
-    let block = panel_block().title_top("⁴ menu • m apply • Esc cancel");
+    let block =
+        panel_block().title_bottom(hotkey_hint_line("m apply • Esc cancel").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let menu_chip = vec![chip_line("menu", Some('m'))];
+    draw_chips_on_border(frame.buffer_mut(), area, area.y, area.x + 1, &menu_chip);
 
     let mut lines = vec![
         Line::from(Span::styled(
