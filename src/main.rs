@@ -1172,6 +1172,17 @@ fn step_to_power(step: i32, min: f64, max: f64, max_steps: i32) -> f64 {
     min + normalized * (max - min)
 }
 
+fn row_band_lower_power(row_from_top: usize, height: usize, min: f64, max: f64) -> f64 {
+    if height == 0 {
+        return min;
+    }
+
+    let row_from_bottom = height - 1 - row_from_top;
+    let max_steps = (height * 4) as i32;
+    let row_base = (row_from_bottom * 4) as i32;
+    step_to_power(row_base, min, max, max_steps)
+}
+
 fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, f64)>> {
     if height == 0 {
         return Vec::new();
@@ -1189,22 +1200,19 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
-    let max_steps = (height * 4) as i32;
-
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
         let row_from_bottom = height - 1 - row_from_top;
         let row_base = (row_from_bottom * 4) as i32;
+        let band_power = row_band_lower_power(row_from_top, height, scale_min, scale_max);
 
         let mut line = Vec::with_capacity(width);
         for col in 0..width {
             let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
             let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
-            let segment_step = (row_base + prev_level.max(curr_level) as i32).clamp(0, max_steps);
-            let segment_power = step_to_power(segment_step, scale_min, scale_max, max_steps);
 
-            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], segment_power));
+            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], band_power));
         }
 
         rows.push(line);
@@ -2013,8 +2021,16 @@ PID COMMAND POWER
         assert_eq!(spectrum_band_color(70.0, &settings), COLOR_RED);
     }
 
+    fn occupied_line_colors(line: &Line<'_>) -> Vec<Color> {
+        line.spans
+            .iter()
+            .filter(|span| span.content.chars().any(|ch| ch != ' '))
+            .filter_map(|span| span.style.fg)
+            .collect()
+    }
+
     #[test]
-    fn braille_history_lines_color_uses_absolute_thresholds() {
+    fn braille_history_lines_color_tracks_row_band_lower_bound() {
         let thresholds = GraphHeatSettings {
             yellow_start: 2.0,
             orange_start: 5.0,
@@ -2023,8 +2039,9 @@ PID COMMAND POWER
 
         let lines = braille_history_lines(&[0.0, 10.0], 1, 1, &thresholds);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].spans.len(), 1);
-        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_RED));
+
+        let colors = occupied_line_colors(&lines[0]);
+        assert_eq!(colors, vec![COLOR_GREEN]);
     }
 
     #[test]
@@ -2039,23 +2056,30 @@ PID COMMAND POWER
 
         let occupied_colors: Vec<Color> = lines
             .iter()
-            .filter_map(|line| {
-                let text: String = line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect();
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    line.spans.first().and_then(|span| span.style.fg)
-                }
-            })
+            .filter_map(|line| occupied_line_colors(line).first().copied())
             .collect();
 
         assert!(occupied_colors.len() >= 3);
         assert_eq!(occupied_colors.first().copied(), Some(COLOR_RED));
         assert_eq!(occupied_colors.last().copied(), Some(COLOR_GREEN));
+    }
+
+    #[test]
+    fn braille_history_lines_use_vertical_bands_not_column_peaks() {
+        let thresholds = GraphHeatSettings {
+            yellow_start: 20.0,
+            orange_start: 40.0,
+            red_start: 60.0,
+        };
+
+        let lines = braille_history_lines(&[80.0, 5.0, 80.0], 2, 8, &thresholds);
+
+        for line in &lines {
+            let colors = occupied_line_colors(line);
+            if let Some(first) = colors.first().copied() {
+                assert!(colors.iter().all(|color| *color == first));
+            }
+        }
     }
 
     #[test]
