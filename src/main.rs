@@ -1160,8 +1160,12 @@ fn draw_chips_on_border(
     chips: &[Vec<Span<'_>>],
 ) -> u16 {
     let cap_style = Style::default().fg(COLOR_MUTED);
-    let left_cap = "┐";
-    let right_cap = "┌";
+    let is_bottom = y + 1 == area.y + area.height;
+    let (left_cap, right_cap) = if is_bottom {
+        ("┘", "└")
+    } else {
+        ("┐", "┌")
+    };
 
     if y < area.y || y >= area.y + area.height {
         return start_x;
@@ -1485,7 +1489,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     });
 
     if !app.show_graph && !app.show_table {
-        draw_easter_egg(frame, frame.area(), app.tick);
+        draw_easter_egg(
+            frame,
+            frame.area(),
+            app.tick,
+            &app.power_history,
+            app.snapshot.total_power,
+        );
         if let Some(modal) = app.settings_modal.as_ref() {
             draw_settings_modal(frame, modal);
         }
@@ -1909,7 +1919,13 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
-fn draw_easter_egg(frame: &mut Frame, area: Rect, tick: u64) {
+fn draw_easter_egg(
+    frame: &mut Frame,
+    area: Rect,
+    tick: u64,
+    power_history: &[f64],
+    current_power: f64,
+) {
     let block = panel_block()
         .title_bottom(hotkey_hint_line("1 graph • 2 table • q quit").right_aligned());
     let inner = block.inner(area);
@@ -1918,47 +1934,66 @@ fn draw_easter_egg(frame: &mut Frame, area: Rect, tick: u64) {
     let chips = vec![chip_line("etop", None)];
     draw_chips_on_border(frame.buffer_mut(), area, area.y, area.x + 1, &chips);
 
-    if inner.width == 0 || inner.height == 0 {
+    if inner.width < 12 || inner.height < 7 {
         return;
     }
 
-    const FRAMES: [&str; 4] = ["⚡", "✦", "⚡", "✧"];
-    let glyph = FRAMES[(tick as usize) % FRAMES.len()];
-    let color = match (tick / 2) % 4 {
-        0 => COLOR_GREEN,
-        1 => COLOR_YELLOW,
-        2 => COLOR_ORANGE,
-        _ => COLOR_RED,
-    };
+    let spark_width = (inner.width * 2 / 3).max(20);
+    let spark_height: u16 = 5;
+    let stack_height = 1 /* power value */ + 1 /* spacer */ + spark_height + 1 /* spacer */ + 1 /* hint */;
+    let start_x = inner.x + (inner.width.saturating_sub(spark_width)) / 2;
+    let start_y = inner.y + inner.height.saturating_sub(stack_height) / 2;
 
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            glyph,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ))
-        .centered(),
-        Line::from(""),
-        Line::from(Span::styled(
-            "etop is still watching",
-            Style::default().fg(COLOR_MUTED),
-        ))
-        .centered(),
-        Line::from(Span::styled(
-            "press 1 or 2 to bring a panel back",
-            Style::default().fg(COLOR_MUTED),
-        ))
-        .centered(),
-    ];
+    let power_style = Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD);
+    let unit_style = Style::default().fg(COLOR_MUTED);
+    let hint_style = Style::default().fg(COLOR_MUTED);
 
-    let para_height = lines.len() as u16;
-    let centered = Rect {
+    let power_line = Line::from(vec![
+        Span::styled(format!("{current_power:.1}"), power_style),
+        Span::styled(" W", unit_style),
+    ])
+    .centered();
+
+    let value_rect = Rect {
         x: inner.x,
-        y: inner.y + inner.height.saturating_sub(para_height) / 2,
+        y: start_y,
         width: inner.width,
-        height: para_height.min(inner.height),
+        height: 1,
     };
-    frame.render_widget(Paragraph::new(lines), centered);
+    frame.render_widget(Paragraph::new(power_line), value_rect);
+
+    let spark_rect = Rect {
+        x: start_x,
+        y: start_y + 2,
+        width: spark_width,
+        height: spark_height,
+    };
+    let samples = history_viewport_samples(power_history, spark_width as usize);
+    let (scale_min, scale_max) = graph_scale_bounds(&samples);
+    let spark_lines = braille_history_lines_with_scale(
+        power_history,
+        spark_width as usize,
+        spark_height as usize,
+        scale_min,
+        scale_max,
+    );
+    frame.render_widget(Paragraph::new(spark_lines), spark_rect);
+
+    let hint = if tick % 8 < 4 {
+        "press 1 or 2 to bring a panel back"
+    } else {
+        "etop is still watching"
+    };
+    let hint_rect = Rect {
+        x: inner.x,
+        y: start_y + 2 + spark_height + 1,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, hint_style)).centered()),
+        hint_rect,
+    );
 }
 
 fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
