@@ -336,6 +336,9 @@ struct App {
     power_history: Vec<f64>,
     visible_indices: Vec<usize>,
     visible_dirty: bool,
+    show_graph: bool,
+    show_table: bool,
+    tick: u64,
 }
 
 impl App {
@@ -356,6 +359,9 @@ impl App {
             power_history: Vec::new(),
             visible_indices: Vec::new(),
             visible_dirty: true,
+            show_graph: true,
+            show_table: true,
+            tick: 0,
         };
 
         let visible_len = app.visible_len();
@@ -436,6 +442,7 @@ impl App {
     }
 
     fn record_history(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
         self.power_history.push(self.snapshot.total_power);
 
         if self.power_history.len() > HISTORY_LIMIT {
@@ -691,9 +698,9 @@ impl App {
         } else if self.filter_input.is_some() {
             "filter edit: Enter apply • Esc cancel"
         } else if self.pinned.is_some() {
-            "Enter unpin • m menu • / filter • space pause • q quit"
+            "Enter unpin • m menu • / filter • 1 graph • space pause • q quit"
         } else {
-            "j/k move • Enter pin • m menu • / filter • space pause • q quit"
+            "j/k move • Enter pin • m menu • / filter • 1 graph • 2 table • space pause • q quit"
         }
     }
 
@@ -721,6 +728,8 @@ impl App {
             KeyCode::Char('/') => self.start_filter_input(),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
+            KeyCode::Char('1') => self.show_graph = !self.show_graph,
+            KeyCode::Char('2') => self.show_table = !self.show_table,
             KeyCode::Enter => self.toggle_pin(),
             _ => {}
         }
@@ -1379,8 +1388,27 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         })
     });
 
-    let layout =
-        Layout::vertical([Constraint::Percentage(34), Constraint::Min(8)]).split(frame.area());
+    if !app.show_graph && !app.show_table {
+        draw_easter_egg(frame, frame.area(), app.tick);
+        if let Some(modal) = app.settings_modal.as_ref() {
+            draw_settings_modal(frame, modal);
+        }
+        return;
+    }
+
+    let constraints: Vec<Constraint> = match (app.show_graph, app.show_table) {
+        (true, true) => vec![Constraint::Percentage(34), Constraint::Min(8)],
+        (true, false) => vec![Constraint::Min(1)],
+        (false, true) => vec![Constraint::Min(1)],
+        (false, false) => unreachable!(),
+    };
+    let layout = Layout::vertical(constraints).split(frame.area());
+    let (graph_slot, table_slot) = match (app.show_graph, app.show_table) {
+        (true, true) => (Some(layout[0]), Some(layout[1])),
+        (true, false) => (Some(layout[0]), None),
+        (false, true) => (None, Some(layout[0])),
+        (false, false) => unreachable!(),
+    };
 
     let mode = if app.paused { "PAUSED" } else { "LIVE" };
     let mode_style = if app.paused {
@@ -1400,69 +1428,76 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Style::default().fg(COLOR_GREEN)
     };
 
-    let graph_area = layout[0];
-    let graph_inner = panel_block().inner(graph_area);
-    let graph_width = graph_inner.width as usize;
-    let graph_height = graph_inner.height as usize;
-    let graph_samples = history_viewport_samples(&app.power_history, graph_width);
-    let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
+    if let Some(graph_area) = graph_slot {
+        let graph_inner = panel_block().inner(graph_area);
+        let graph_width = graph_inner.width as usize;
+        let graph_height = graph_inner.height as usize;
+        let graph_samples = history_viewport_samples(&app.power_history, graph_width);
+        let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
 
-    let graph_title_left = Line::from(vec![
-        Span::styled(
-            "¹ etop ",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(mode, mode_style),
-        Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(load_state, load_style),
-    ]);
-    let graph_title_right = Line::from(vec![
-        Span::styled("power ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(
-            format!("{:.1}", app.snapshot.total_power),
-            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                " • {} pts • {:.1}–{:.1}",
-                app.power_history.len(),
-                scale_min,
-                scale_max
+        let graph_title_left = Line::from(vec![
+            Span::styled(
+                "¹ etop ",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Style::default().fg(COLOR_MUTED),
-        ),
-    ])
-    .right_aligned();
+            Span::styled(mode, mode_style),
+            Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(load_state, load_style),
+        ]);
+        let graph_title_right = Line::from(vec![
+            Span::styled("power ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.1}", app.snapshot.total_power),
+                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " • {} pts • {:.1}–{:.1}",
+                    app.power_history.len(),
+                    scale_min,
+                    scale_max
+                ),
+                Style::default().fg(COLOR_MUTED),
+            ),
+        ])
+        .right_aligned();
 
-    let mut graph_bottom_spans = hotkey_hint_line("space pause • m menu").spans;
-    if let Some(error) = app.last_error.as_deref() {
-        graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
-        graph_bottom_spans.push(Span::styled(
-            format!("error: {error}"),
-            Style::default().fg(COLOR_RED),
-        ));
+        let mut graph_bottom_spans =
+            hotkey_hint_line("space pause • m menu • 2 table").spans;
+        if let Some(error) = app.last_error.as_deref() {
+            graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
+            graph_bottom_spans.push(Span::styled(
+                format!("error: {error}"),
+                Style::default().fg(COLOR_RED),
+            ));
+        }
+        let graph_block = panel_block()
+            .title_top(graph_title_left)
+            .title_top(graph_title_right)
+            .title_bottom(Line::from(graph_bottom_spans));
+        frame.render_widget(graph_block, graph_area);
+
+        debug_assert!(graph_height > 0 || graph_width == 0);
+        let graph_lines = braille_history_lines_with_scale(
+            &app.power_history,
+            graph_width,
+            graph_height,
+            scale_min,
+            scale_max,
+        );
+
+        let graph = Paragraph::new(graph_lines);
+        frame.render_widget(graph, graph_inner);
     }
-    let graph_block = panel_block()
-        .title_top(graph_title_left)
-        .title_top(graph_title_right)
-        .title_bottom(Line::from(graph_bottom_spans));
-    frame.render_widget(graph_block, graph_area);
 
-    debug_assert!(graph_height > 0 || graph_width == 0);
-    let graph_lines = braille_history_lines_with_scale(
-        &app.power_history,
-        graph_width,
-        graph_height,
-        scale_min,
-        scale_max,
-    );
-
-    let graph = Paragraph::new(graph_lines);
-    frame.render_widget(graph, graph_inner);
-
-    let table_region = layout[1];
+    let Some(table_region) = table_slot else {
+        if let Some(modal) = app.settings_modal.as_ref() {
+            draw_settings_modal(frame, modal);
+        }
+        return;
+    };
     let (detail_area, rows_area) = if pinned.is_some() {
         let min_rows: u16 = 6;
         let max_detail = table_region.height.saturating_sub(min_rows);
@@ -1483,9 +1518,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     if let Some(detail_rect) = detail_area {
         let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("³ pinned {} • Enter unpin", pin.pid)
+            format!("pinned {} • Enter unpin", pin.pid)
         } else {
-            "³ pinned process".to_string()
+            "pinned process".to_string()
         };
 
         let detail_block = panel_block().title_top(detail_title);
@@ -1720,6 +1755,56 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - width_percent) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+fn draw_easter_egg(frame: &mut Frame, area: Rect, tick: u64) {
+    let block = panel_block()
+        .title_top("etop")
+        .title_bottom(hotkey_hint_line("1 graph • 2 table • q quit"));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    const FRAMES: [&str; 4] = ["⚡", "✦", "⚡", "✧"];
+    let glyph = FRAMES[(tick as usize) % FRAMES.len()];
+    let color = match (tick / 2) % 4 {
+        0 => COLOR_GREEN,
+        1 => COLOR_YELLOW,
+        2 => COLOR_ORANGE,
+        _ => COLOR_RED,
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            glyph,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
+        Line::from(""),
+        Line::from(Span::styled(
+            "etop is still watching",
+            Style::default().fg(COLOR_MUTED),
+        ))
+        .centered(),
+        Line::from(Span::styled(
+            "press 1 or 2 to bring a panel back",
+            Style::default().fg(COLOR_MUTED),
+        ))
+        .centered(),
+    ];
+
+    let para_height = lines.len() as u16;
+    let centered = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(para_height) / 2,
+        width: inner.width,
+        height: para_height.min(inner.height),
+    };
+    frame.render_widget(Paragraph::new(lines), centered);
 }
 
 fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
