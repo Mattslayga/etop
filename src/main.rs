@@ -578,7 +578,7 @@ impl App {
                 KeyCode::Esc => {
                     close_modal = true;
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') => {
+                KeyCode::Char('m') | KeyCode::Char('M') => {
                     match modal.draft.graph_heat.validate() {
                         Ok(()) => {
                             apply_settings = Some(modal.draft.clone());
@@ -687,13 +687,13 @@ impl App {
 
     fn status_hint(&self) -> &'static str {
         if self.settings_modal.is_some() {
-            "settings: Enter edit • t apply • Esc cancel"
+            "settings: Enter edit • m apply • Esc cancel"
         } else if self.filter_input.is_some() {
             "filter edit: Enter apply • Esc cancel"
         } else if self.pinned.is_some() {
-            "Enter unpin • t settings • / filter • space pause • q quit"
+            "Enter unpin • m menu • / filter • space pause • q quit"
         } else {
-            "j/k move • Enter pin • t settings • / filter • space pause • q quit"
+            "j/k move • Enter pin • m menu • / filter • space pause • q quit"
         }
     }
 
@@ -720,7 +720,7 @@ impl App {
             KeyCode::Char('G') if !self.is_pinned() => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
             KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('t') | KeyCode::Char('T') => self.open_settings_modal(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
             KeyCode::Enter => self.toggle_pin(),
             _ => {}
         }
@@ -1436,7 +1436,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     ])
     .right_aligned();
 
-    let mut graph_bottom_spans = hotkey_hint_line("space pause • t settings").spans;
+    let mut graph_bottom_spans = hotkey_hint_line("space pause • m menu").spans;
     if let Some(error) = app.last_error.as_deref() {
         graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
         graph_bottom_spans.push(Span::styled(
@@ -1726,7 +1726,7 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
 
-    let block = panel_block().title_top("⁴ settings • t apply • Esc cancel");
+    let block = panel_block().title_top("⁴ menu • m apply • Esc cancel");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1798,7 +1798,7 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "↑/↓ move • Enter edit field • t apply and close",
+            "↑/↓ move • Enter edit field • m apply and close",
             Style::default().fg(COLOR_MUTED),
         )));
     }
