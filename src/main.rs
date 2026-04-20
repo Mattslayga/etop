@@ -11,7 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 const TOP_BIN: &str = "top";
@@ -32,7 +32,6 @@ const SAMPLER_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const SAMPLER_QUEUE_CAPACITY: usize = 8;
 const HISTORY_LIMIT: usize = 240;
 
-const COLOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
 const COLOR_FG: Color = Color::Rgb(0xab, 0xb2, 0xbf);
 const COLOR_ACCENT: Color = Color::Rgb(0x61, 0xaf, 0xef);
 const COLOR_MUTED: Color = Color::Rgb(0x5c, 0x63, 0x70);
@@ -47,7 +46,6 @@ const BRAILLE_5X5: [char; 25] = [
     ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
     '⣾', '⡇', '⣇', '⣧', '⣷', '⣿',
 ];
-
 #[derive(Debug, Clone)]
 struct ProcRow {
     pid: i32,
@@ -438,6 +436,10 @@ impl App {
         }
     }
 
+    fn graph_scale_bounds_for_viewport(&self, samples: &[f64]) -> (f64, f64) {
+        graph_scale_bounds(samples)
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let len = self.visible_len();
         if len == 0 {
@@ -650,14 +652,6 @@ impl App {
         match event {
             CollectorEvent::Snapshot(next) => self.apply_snapshot(next),
             CollectorEvent::Error(err) => self.apply_refresh_error(err),
-        }
-    }
-
-    fn display_filter_text(&self) -> String {
-        if self.active_filter().is_empty() {
-            "(none)".to_string()
-        } else {
-            self.active_filter().to_string()
         }
     }
 
@@ -1063,13 +1057,37 @@ fn drain_collector_events(app: &mut App, event_rx: &Receiver<CollectorEvent>) {
 fn panel_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_MUTED))
         .title_style(
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
-        .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
+        .style(Style::default().fg(COLOR_FG))
+}
+
+fn hotkey_hint_line(hint: &str) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(COLOR_MUTED);
+    let sep_style = Style::default().fg(COLOR_MUTED);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, chunk) in hint.split(" • ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" • ", sep_style));
+        }
+        match chunk.split_once(' ') {
+            Some((key, rest)) if !key.is_empty() && !rest.is_empty() && !key.ends_with(':') => {
+                spans.push(Span::styled(key.to_string(), key_style));
+                spans.push(Span::styled(format!(" {rest}"), text_style));
+            }
+            _ => spans.push(Span::styled(chunk.to_string(), text_style)),
+        }
+    }
+    Line::from(spans)
 }
 
 fn format_setting_value(value: f64) -> String {
@@ -1102,7 +1120,7 @@ fn history_range(values: &[f64]) -> Option<(f64, f64)> {
 }
 
 fn history_viewport_samples(values: &[f64], width: usize) -> Vec<f64> {
-    let points = width.saturating_add(1);
+    let points = width.saturating_mul(2);
     if points == 0 {
         return Vec::new();
     }
@@ -1155,7 +1173,7 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
     }
 
     let normalized = (activity / (max - min)).clamp(0.0, 1.0);
-    (normalized * max_steps as f64).round() as i32
+    ((normalized * max_steps as f64).round() as i32).max(1)
 }
 
 fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
@@ -1164,32 +1182,37 @@ fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
 
 fn graph_span_style(color: Option<Color>) -> Style {
     match color {
-        Some(color) => Style::default().fg(color).bg(COLOR_BG),
-        None => Style::default().fg(COLOR_BG).bg(COLOR_BG),
+        Some(color) => Style::default().fg(color),
+        None => Style::default(),
     }
 }
 
-fn step_to_power(step: i32, min: f64, max: f64, max_steps: i32) -> f64 {
-    if max_steps <= 0 || max <= min {
-        return min;
-    }
-
-    let normalized = (step as f64 / max_steps as f64).clamp(0.0, 1.0);
-    min + normalized * (max - min)
-}
-
-fn row_band_lower_power(row_from_top: usize, height: usize, min: f64, max: f64) -> f64 {
-    if height == 0 {
-        return min;
+fn row_position_color(row_from_top: usize, height: usize) -> Color {
+    if height <= 1 {
+        return COLOR_GREEN;
     }
 
     let row_from_bottom = height - 1 - row_from_top;
-    let max_steps = (height * 4) as i32;
-    let row_base = (row_from_bottom * 4) as i32;
-    step_to_power(row_base, min, max, max_steps)
+    let fraction = row_from_bottom as f64 / (height - 1) as f64;
+
+    if fraction >= 0.85 {
+        COLOR_RED
+    } else if fraction >= 0.65 {
+        COLOR_ORANGE
+    } else if fraction >= 0.40 {
+        COLOR_YELLOW
+    } else {
+        COLOR_GREEN
+    }
 }
 
-fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, f64)>> {
+fn braille_history_cells_with_scale(
+    values: &[f64],
+    width: usize,
+    height: usize,
+    scale_min: f64,
+    scale_max: f64,
+) -> Vec<Vec<(char, Color)>> {
     if height == 0 {
         return Vec::new();
     }
@@ -1199,74 +1222,75 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
     }
 
     let samples = history_viewport_samples(values, width);
-    let (scale_min, scale_max) = graph_scale_bounds(&samples);
 
     let steps: Vec<i32> = samples
         .iter()
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
+
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
         let row_from_bottom = height - 1 - row_from_top;
         let row_base = (row_from_bottom * 4) as i32;
-        let band_power = row_band_lower_power(row_from_top, height, scale_min, scale_max);
+        let row_color = row_position_color(row_from_top, height);
 
         let mut line = Vec::with_capacity(width);
         for col in 0..width {
-            let prev_level = (steps[col] - row_base).clamp(0, 4) as usize;
-            let curr_level = (steps[col + 1] - row_base).clamp(0, 4) as usize;
-
-            line.push((BRAILLE_5X5[prev_level * 5 + curr_level], band_power));
+            let left_level = (steps[col * 2] - row_base).clamp(0, 4) as usize;
+            let right_level = (steps[col * 2 + 1] - row_base).clamp(0, 4) as usize;
+            line.push((BRAILLE_5X5[left_level * 5 + right_level], row_color));
         }
 
         rows.push(line);
     }
 
-    let bottom_band_power = row_band_lower_power(height - 1, height, scale_min, scale_max);
+    let bottom_row_color = row_position_color(height - 1, height);
     for col in 0..width {
         let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
         if has_visible_segment {
             continue;
         }
 
-        let prev_active = (samples[col] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        let curr_active = (samples[col + 1] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        if !prev_active && !curr_active {
+        let left_active = (samples[col * 2] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
+        let right_active = (samples[col * 2 + 1] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
+        if !left_active && !right_active {
             continue;
         }
 
-        let prev_level = usize::from(prev_active);
-        let curr_level = usize::from(curr_active);
         rows[height - 1][col] = (
-            BRAILLE_5X5[prev_level * 5 + curr_level],
-            bottom_band_power,
+            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
+            bottom_row_color,
         );
     }
 
     rows
 }
 
-fn braille_history_lines(
+#[cfg(test)]
+fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, Color)>> {
+    let samples = history_viewport_samples(values, width);
+    let (scale_min, scale_max) = graph_scale_bounds(&samples);
+    braille_history_cells_with_scale(values, width, height, scale_min, scale_max)
+}
+
+fn braille_history_lines_with_scale(
     values: &[f64],
     width: usize,
     height: usize,
-    graph_heat: &GraphHeatSettings,
+    scale_min: f64,
+    scale_max: f64,
 ) -> Vec<Line<'static>> {
-    braille_history_cells(values, width, height)
+    braille_history_cells_with_scale(values, width, height, scale_min, scale_max)
         .into_iter()
         .map(|row| {
             let mut spans: Vec<Span> = Vec::new();
             let mut run = String::new();
             let mut run_color: Option<Color> = None;
 
-            for (ch, peak_power) in row {
-                let color = if ch == ' ' {
-                    None
-                } else {
-                    Some(spectrum_band_color(peak_power, graph_heat))
-                };
+            for (ch, cell_color) in row {
+                let color = if ch == ' ' { None } else { Some(cell_color) };
 
                 if color != run_color && !run.is_empty() {
                     spans.push(Span::styled(
@@ -1289,6 +1313,13 @@ fn braille_history_lines(
 }
 
 #[cfg(test)]
+fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
+    let samples = history_viewport_samples(values, width);
+    let (scale_min, scale_max) = graph_scale_bounds(&samples);
+    braille_history_lines_with_scale(values, width, height, scale_min, scale_max)
+}
+
+#[cfg(test)]
 fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<String> {
     braille_history_cells(values, width, height)
         .into_iter()
@@ -1297,9 +1328,6 @@ fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<Stri
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
-    let base_style = Style::default().bg(COLOR_BG).fg(COLOR_FG);
-    frame.render_widget(Block::default().style(base_style), frame.area());
-
     app.rebuild_visible_if_needed();
     let visible_len = app.visible_indices.len();
     app.normalize_selection(visible_len);
@@ -1321,12 +1349,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         })
     });
 
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Percentage(34),
-        Constraint::Min(8),
-    ])
-    .split(frame.area());
+    let layout =
+        Layout::vertical([Constraint::Percentage(34), Constraint::Min(8)]).split(frame.area());
 
     let mode = if app.paused { "PAUSED" } else { "LIVE" };
     let mode_style = if app.paused {
@@ -1346,110 +1370,69 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Style::default().fg(COLOR_GREEN)
     };
 
-    let filter_display = app.display_filter_text();
+    let graph_area = layout[0];
+    let graph_inner = panel_block().inner(graph_area);
+    let graph_width = graph_inner.width as usize;
+    let graph_height = graph_inner.height as usize;
+    let graph_samples = history_viewport_samples(&app.power_history, graph_width);
+    let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
 
-    let mut top_spans = vec![
+    let graph_title_left = Line::from(vec![
         Span::styled(
-            "etop",
+            "¹ etop ",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default().fg(COLOR_MUTED)),
         Span::styled(mode, mode_style),
         Span::styled(" • ", Style::default().fg(COLOR_MUTED)),
         Span::styled(load_state, load_style),
-        Span::styled(" • rows:", Style::default().fg(COLOR_MUTED)),
-        Span::styled(
-            format!("{visible_len}/{}", app.snapshot.rows.len()),
-            Style::default().fg(COLOR_FG),
-        ),
-        Span::styled(" • power:", Style::default().fg(COLOR_MUTED)),
-        Span::styled(
-            format!("{:.1}", app.snapshot.total_power),
-            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" • filter:", Style::default().fg(COLOR_MUTED)),
-        Span::styled(
-            filter_display,
-            if app.active_filter().is_empty() {
-                Style::default().fg(COLOR_MUTED)
-            } else {
-                Style::default().fg(COLOR_FG)
-            },
-        ),
-    ];
-
-    if let Some(pin) = pinned.as_ref() {
-        top_spans.push(Span::styled(" • pinned:", Style::default().fg(COLOR_MUTED)));
-        top_spans.push(Span::styled(
-            pin.pid.to_string(),
-            Style::default().fg(COLOR_ACCENT),
-        ));
-    }
-
-    top_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
-    top_spans.push(Span::styled(
-        app.status_hint(),
-        Style::default().fg(COLOR_MUTED),
-    ));
-
-    if let Some(error) = app.last_error.as_deref() {
-        top_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
-        top_spans.push(Span::styled(
-            format!("error: {error}"),
-            Style::default().fg(COLOR_RED),
-        ));
-    }
-
-    let top_bar = Paragraph::new(Line::from(top_spans))
-        .style(base_style)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(top_bar, layout[0]);
-
-    let graph_block = panel_block().title("Power history (braille)");
-    let graph_inner = graph_block.inner(layout[1]);
-    frame.render_widget(graph_block, layout[1]);
-
-    let graph_rows =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(graph_inner);
-
-    let graph_width = graph_rows[1].width as usize;
-    let graph_height = graph_rows[1].height as usize;
-    let graph_samples = history_viewport_samples(&app.power_history, graph_width);
-    let (scale_min, scale_max) = graph_scale_bounds(&graph_samples);
-    let graph_label = Paragraph::new(Line::from(vec![
-        Span::styled("POWER ", Style::default().fg(COLOR_MUTED)),
+    ]);
+    let graph_title_right = Line::from(vec![
+        Span::styled("power ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
             format!("{:.1}", app.snapshot.total_power),
             Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
-                "  • {} points  • range {:.1}–{:.1}",
+                " • {} pts • {:.1}–{:.1}",
                 app.power_history.len(),
                 scale_min,
                 scale_max
             ),
             Style::default().fg(COLOR_MUTED),
         ),
-    ]));
-    debug_assert!(graph_height > 0 || graph_width == 0);
-    frame.render_widget(graph_label, graph_rows[0]);
+    ])
+    .right_aligned();
 
-    let graph_lines = braille_history_lines(
+    let mut graph_bottom_spans = hotkey_hint_line("space pause • t settings").spans;
+    if let Some(error) = app.last_error.as_deref() {
+        graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
+        graph_bottom_spans.push(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(COLOR_RED),
+        ));
+    }
+    let graph_block = panel_block()
+        .title_top(graph_title_left)
+        .title_top(graph_title_right)
+        .title_bottom(Line::from(graph_bottom_spans));
+    frame.render_widget(graph_block, graph_area);
+
+    debug_assert!(graph_height > 0 || graph_width == 0);
+    let graph_lines = braille_history_lines_with_scale(
         &app.power_history,
         graph_width,
         graph_height,
-        &app.settings.graph_heat,
+        scale_min,
+        scale_max,
     );
 
-    let graph = Paragraph::new(graph_lines)
-        .style(Style::default().bg(COLOR_BG))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(graph, graph_rows[1]);
+    let graph = Paragraph::new(graph_lines);
+    frame.render_widget(graph, graph_inner);
 
-    let table_region = layout[2];
+    let table_region = layout[1];
     let (detail_area, rows_area) = if pinned.is_some() {
         let min_rows: u16 = 6;
         let max_detail = table_region.height.saturating_sub(min_rows);
@@ -1494,7 +1477,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                         Span::styled("pwr ", Style::default().fg(COLOR_MUTED)),
                         Span::styled(
                             row.power.clone(),
-                            Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(spectrum_band_color(row.power_num, &app.settings.graph_heat))
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ]),
                     Line::from(vec![
@@ -1528,13 +1513,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         };
 
         let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("Pinned process {} • Enter unpin", pin.pid)
+            format!("³ pinned {} • Enter unpin", pin.pid)
         } else {
-            "Pinned process".to_string()
+            "³ pinned process".to_string()
         };
 
         let detail = Paragraph::new(detail_lines)
-            .block(panel_block().title(detail_title))
+            .block(panel_block().title_top(detail_title))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, detail_rect);
     }
@@ -1559,6 +1544,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         (start + rows_visible).min(visible_len)
     };
 
+    let graph_heat = app.settings.graph_heat.clone();
     let rows = app.visible_indices[start..end].iter().map(|idx| {
         let r = &app.snapshot.rows[*idx];
         let is_pinned_row = pinned
@@ -1578,7 +1564,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         Row::new([
             Cell::from(r.pid.to_string()),
             Cell::from(r.process.clone()),
-            Cell::from(r.power.clone()).style(Style::default().fg(COLOR_RED)),
+            Cell::from(r.power.clone())
+                .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
         ])
         .style(row_style)
     });
@@ -1602,20 +1589,20 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     let table_title = if app.filter_input.is_some() {
         format!(
-            "Processes {visible_len}/{} • filter edit: {}{}",
+            "² processes {visible_len}/{} • filter edit: {}{}",
             app.snapshot.rows.len(),
             app.active_filter(),
             pin_suffix,
         )
     } else if app.filter_query.is_empty() {
         format!(
-            "Processes {visible_len}/{} • power ↓{}",
+            "² processes {visible_len}/{} • power ↓{}",
             app.snapshot.rows.len(),
             pin_suffix,
         )
     } else {
         format!(
-            "Processes {visible_len}/{} • power ↓ • filter: {}{}",
+            "² processes {visible_len}/{} • power ↓ • filter: {}{}",
             app.snapshot.rows.len(),
             app.filter_query,
             pin_suffix,
@@ -1623,13 +1610,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let highlight_style = if app.is_pinned() {
-        Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM)
+        Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default()
             .bg(COLOR_SELECTED_BG)
-            .fg(COLOR_FG)
             .add_modifier(Modifier::BOLD)
     };
+
+    let table_block = panel_block()
+        .title_top(table_title)
+        .title_bottom(hotkey_hint_line(app.status_hint()));
 
     let table = Table::new(
         rows,
@@ -1640,9 +1630,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         ],
     )
     .header(header_row)
-    .block(panel_block().title(table_title))
+    .block(table_block)
     .column_spacing(1)
-    .style(Style::default().fg(COLOR_FG).bg(COLOR_BG))
+    .style(Style::default().fg(COLOR_FG))
     .row_highlight_style(highlight_style);
 
     let selected_in_window = if visible_len == 0 || app.is_pinned() {
@@ -1678,7 +1668,7 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
 
-    let block = panel_block().title("Settings • t apply • Esc cancel");
+    let block = panel_block().title_top("⁴ settings • t apply • Esc cancel");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1756,7 +1746,7 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     }
 
     let content = Paragraph::new(lines)
-        .style(Style::default().bg(COLOR_BG).fg(COLOR_FG))
+        .style(Style::default().fg(COLOR_FG))
         .wrap(Wrap { trim: false });
     frame.render_widget(content, inner);
 }
@@ -1983,30 +1973,30 @@ PID COMMAND POWER
 
     #[test]
     fn history_viewport_samples_keeps_latest_points_without_resampling() {
-        let samples = history_viewport_samples(&[1.0, 2.0, 3.0, 4.0, 5.0], 3);
-        assert_eq!(samples, vec![2.0, 3.0, 4.0, 5.0]);
+        let samples = history_viewport_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 3);
+        assert_eq!(samples, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     }
 
     #[test]
     fn history_viewport_samples_shifts_left_as_new_samples_arrive() {
         let width = 3;
-        let before = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0], width);
-        let after = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0], width);
+        let before = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], width);
+        let after = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], width);
 
-        assert_eq!(&after[..width], &before[1..]);
-        assert_eq!(after[width], 4.0);
+        assert_eq!(&after[..(width * 2) - 1], &before[1..]);
+        assert_eq!(after[(width * 2) - 1], 6.0);
     }
 
     #[test]
-    fn history_viewport_samples_right_aligns_short_history() {
+    fn history_viewport_samples_left_pads_short_history_without_faking_plateaus() {
         let samples = history_viewport_samples(&[7.0, 8.0], 4);
-        assert_eq!(samples, vec![0.0, 0.0, 0.0, 7.0, 8.0]);
+        assert_eq!(samples, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]);
     }
 
     #[test]
-    fn value_to_vertical_steps_quantizes_low_nonzero_to_zero_before_fallback() {
+    fn value_to_vertical_steps_keeps_low_nonzero_activity_visible() {
         let steps = value_to_vertical_steps(0.1, 0.0, 200.0, 8);
-        assert_eq!(steps, 0);
+        assert_eq!(steps, 1);
     }
 
     #[test]
@@ -2017,15 +2007,15 @@ PID COMMAND POWER
 
     #[test]
     fn braille_history_rows_keeps_low_nonzero_activity_visible() {
-        let rows = braille_history_rows(&[100.0, 0.1, 0.1, 0.1], 3, 4);
+        let rows = braille_history_rows(&[0.1, 0.1, 0.1, 0.1], 2, 4);
 
         let bottom = rows.last().expect("graph should have rows");
+        assert_ne!(bottom.chars().nth(0), Some(' '));
         assert_ne!(bottom.chars().nth(1), Some(' '));
-        assert_ne!(bottom.chars().nth(2), Some(' '));
 
         for row in rows.iter().take(rows.len().saturating_sub(1)) {
+            assert_eq!(row.chars().nth(0), Some(' '));
             assert_eq!(row.chars().nth(1), Some(' '));
-            assert_eq!(row.chars().nth(2), Some(' '));
         }
     }
 
@@ -2042,17 +2032,17 @@ PID COMMAND POWER
     #[test]
     fn braille_history_rows_treats_near_zero_as_blank() {
         let low = GRAPH_ACTIVITY_EPSILON * 0.5;
-        let rows = braille_history_rows(&[100.0, low, low, low], 3, 4);
+        let rows = braille_history_rows(&[low, low, low, low], 2, 4);
 
         for row in &rows {
+            assert_eq!(row.chars().nth(0), Some(' '));
             assert_eq!(row.chars().nth(1), Some(' '));
-            assert_eq!(row.chars().nth(2), Some(' '));
         }
     }
 
     #[test]
     fn braille_history_rows_single_row_uses_lookup_mapping() {
-        let rows = braille_history_rows(&[0.0, 10.0], 1, 1);
+        let rows = braille_history_rows(&[10.0], 1, 1);
         assert_eq!(rows, vec!["⢰".to_string()]);
     }
 
@@ -2104,49 +2094,28 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn braille_history_lines_color_tracks_row_band_lower_bound() {
-        let thresholds = GraphHeatSettings {
-            yellow_start: 2.0,
-            orange_start: 5.0,
-            red_start: 8.0,
-        };
-
-        let lines = braille_history_lines(&[0.0, 10.0], 1, 1, &thresholds);
-        assert_eq!(lines.len(), 1);
-
-        let colors = occupied_line_colors(&lines[0]);
-        assert_eq!(colors, vec![COLOR_GREEN]);
+    fn row_position_color_bottom_row_is_green() {
+        assert_eq!(row_position_color(9, 10), COLOR_GREEN);
+        assert_eq!(row_position_color(0, 1), COLOR_GREEN);
     }
 
     #[test]
-    fn braille_history_lines_do_not_flood_hot_colors_to_baseline() {
-        let thresholds = GraphHeatSettings {
-            yellow_start: 20.0,
-            orange_start: 40.0,
-            red_start: 60.0,
-        };
-
-        let lines = braille_history_lines(&[80.0, 80.0], 1, 8, &thresholds);
-
-        let occupied_colors: Vec<Color> = lines
-            .iter()
-            .filter_map(|line| occupied_line_colors(line).first().copied())
-            .collect();
-
-        assert!(occupied_colors.len() >= 3);
-        assert_eq!(occupied_colors.first().copied(), Some(COLOR_RED));
-        assert_eq!(occupied_colors.last().copied(), Some(COLOR_GREEN));
+    fn row_position_color_top_row_is_red() {
+        assert_eq!(row_position_color(0, 10), COLOR_RED);
     }
 
     #[test]
-    fn braille_history_lines_use_vertical_bands_not_column_peaks() {
-        let thresholds = GraphHeatSettings {
-            yellow_start: 20.0,
-            orange_start: 40.0,
-            red_start: 60.0,
-        };
+    fn row_position_color_spans_full_spectrum_over_tall_graph() {
+        let colors: Vec<Color> = (0..10).map(|r| row_position_color(r, 10)).collect();
+        assert!(colors.contains(&COLOR_RED));
+        assert!(colors.contains(&COLOR_ORANGE));
+        assert!(colors.contains(&COLOR_YELLOW));
+        assert!(colors.contains(&COLOR_GREEN));
+    }
 
-        let lines = braille_history_lines(&[80.0, 5.0, 80.0], 2, 8, &thresholds);
+    #[test]
+    fn graph_row_color_depends_only_on_position_not_column_value() {
+        let lines = braille_history_lines(&[80.0, 5.0, 80.0], 2, 8);
 
         for line in &lines {
             let colors = occupied_line_colors(line);
@@ -2154,6 +2123,23 @@ PID COMMAND POWER
                 assert!(colors.iter().all(|color| *color == first));
             }
         }
+    }
+
+    #[test]
+    fn app_graph_scale_recovers_after_spike_leaves_viewport() {
+        let app = App::new();
+
+        let width = 3;
+        let spike_visible = history_viewport_samples(&[2.0, 180.0, 3.0, 4.0, 4.0, 4.0], width);
+        let (_, spike_max) = app.graph_scale_bounds_for_viewport(&spike_visible);
+
+        let spike_aged_out =
+            history_viewport_samples(&[2.0, 180.0, 3.0, 4.0, 4.0, 4.0, 4.0, 4.0], width);
+        let (_, recovered_max) = app.graph_scale_bounds_for_viewport(&spike_aged_out);
+        let (_, expected_recovered_max) = graph_scale_bounds(&spike_aged_out);
+
+        assert!(recovered_max < spike_max);
+        assert_eq!(recovered_max, expected_recovered_max);
     }
 
     #[test]
