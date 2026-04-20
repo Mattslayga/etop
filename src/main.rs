@@ -1150,8 +1150,8 @@ fn draw_chips_on_border(
     chips: &[Vec<Span<'_>>],
 ) -> u16 {
     let cap_style = Style::default().fg(COLOR_MUTED);
-    let left_cap = "┤";
-    let right_cap = "├";
+    let left_cap = "┐";
+    let right_cap = "┌";
 
     if y < area.y || y >= area.y + area.height {
         return start_x;
