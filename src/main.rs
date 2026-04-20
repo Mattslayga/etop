@@ -41,6 +41,7 @@ const COLOR_GREEN: Color = Color::Rgb(0x98, 0xc3, 0x79);
 const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const COLOR_ORANGE: Color = Color::Rgb(0xd1, 0x9a, 0x66);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+const GRAPH_ACTIVITY_EPSILON: f64 = 1e-3;
 
 const BRAILLE_5X5: [char; 25] = [
     ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
@@ -1147,9 +1148,16 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
     }
 
     let max_steps = (rows * 4) as i32;
-    let normalized = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    let activity = (value - min).max(0.0);
 
-    (normalized * max_steps as f64).round() as i32
+    if activity <= GRAPH_ACTIVITY_EPSILON {
+        return 0;
+    }
+
+    let normalized = (activity / (max - min)).clamp(0.0, 1.0);
+    let quantized = (normalized * max_steps as f64).round() as i32;
+
+    quantized.max(1)
 }
 
 fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
@@ -1974,6 +1982,43 @@ PID COMMAND POWER
     fn history_viewport_samples_right_aligns_short_history() {
         let samples = history_viewport_samples(&[7.0, 8.0], 4);
         assert_eq!(samples, vec![0.0, 0.0, 0.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn value_to_vertical_steps_clamps_low_nonzero_to_one_sub_row() {
+        let steps = value_to_vertical_steps(0.1, 0.0, 200.0, 8);
+        assert_eq!(steps, 1);
+    }
+
+    #[test]
+    fn value_to_vertical_steps_keeps_near_zero_blank() {
+        let steps = value_to_vertical_steps(GRAPH_ACTIVITY_EPSILON * 0.5, 0.0, 200.0, 8);
+        assert_eq!(steps, 0);
+    }
+
+    #[test]
+    fn braille_history_rows_keeps_low_nonzero_activity_visible() {
+        let rows = braille_history_rows(&[100.0, 0.1, 0.1, 0.1], 3, 4);
+
+        let bottom = rows.last().expect("graph should have rows");
+        assert_ne!(bottom.chars().nth(1), Some(' '));
+        assert_ne!(bottom.chars().nth(2), Some(' '));
+
+        for row in rows.iter().take(rows.len().saturating_sub(1)) {
+            assert_eq!(row.chars().nth(1), Some(' '));
+            assert_eq!(row.chars().nth(2), Some(' '));
+        }
+    }
+
+    #[test]
+    fn braille_history_rows_treats_near_zero_as_blank() {
+        let low = GRAPH_ACTIVITY_EPSILON * 0.5;
+        let rows = braille_history_rows(&[100.0, low, low, low], 3, 4);
+
+        for row in &rows {
+            assert_eq!(row.chars().nth(1), Some(' '));
+            assert_eq!(row.chars().nth(2), Some(' '));
+        }
     }
 
     #[test]
