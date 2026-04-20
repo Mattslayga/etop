@@ -1553,7 +1553,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(graph_block, graph_area);
 
         let graph_chips = vec![
-            chip_line("1etop", Some('1')),
+            chip_line("¹etop", Some('¹')),
             {
                 let mut spans = chip_line(mode, None);
                 for span in &mut spans {
@@ -1835,7 +1835,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, rows_area, &mut table_state);
 
-    let table_chips = vec![chip_line("2processes", Some('2'))];
+    let table_chips = vec![chip_line("²processes", Some('²'))];
     draw_chips_on_border(
         frame.buffer_mut(),
         rows_area,
