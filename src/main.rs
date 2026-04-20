@@ -1155,9 +1155,7 @@ fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
     }
 
     let normalized = (activity / (max - min)).clamp(0.0, 1.0);
-    let quantized = (normalized * max_steps as f64).round() as i32;
-
-    quantized.max(1)
+    (normalized * max_steps as f64).round() as i32
 }
 
 fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
@@ -1224,6 +1222,27 @@ fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec
         }
 
         rows.push(line);
+    }
+
+    let bottom_band_power = row_band_lower_power(height - 1, height, scale_min, scale_max);
+    for col in 0..width {
+        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
+        if has_visible_segment {
+            continue;
+        }
+
+        let prev_active = (samples[col] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
+        let curr_active = (samples[col + 1] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
+        if !prev_active && !curr_active {
+            continue;
+        }
+
+        let prev_level = usize::from(prev_active);
+        let curr_level = usize::from(curr_active);
+        rows[height - 1][col] = (
+            BRAILLE_5X5[prev_level * 5 + curr_level],
+            bottom_band_power,
+        );
     }
 
     rows
@@ -1985,9 +2004,9 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn value_to_vertical_steps_clamps_low_nonzero_to_one_sub_row() {
+    fn value_to_vertical_steps_quantizes_low_nonzero_to_zero_before_fallback() {
         let steps = value_to_vertical_steps(0.1, 0.0, 200.0, 8);
-        assert_eq!(steps, 1);
+        assert_eq!(steps, 0);
     }
 
     #[test]
@@ -2008,6 +2027,16 @@ PID COMMAND POWER
             assert_eq!(row.chars().nth(1), Some(' '));
             assert_eq!(row.chars().nth(2), Some(' '));
         }
+    }
+
+    #[test]
+    fn braille_history_rows_uses_baseline_fallback_without_changing_geometry() {
+        let rows = braille_history_rows(&[0.1, 0.1], 1, 4);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], " ");
+        assert_eq!(rows[1], " ");
+        assert_eq!(rows[2], " ");
+        assert_ne!(rows[3], " ");
     }
 
     #[test]
