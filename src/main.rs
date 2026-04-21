@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io::{self, BufRead, BufReader},
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
@@ -8,28 +8,37 @@ use std::{
     time::Duration,
 };
 
+mod app_state;
+mod archive_query;
+mod graph;
 mod history;
 mod persistence;
+mod top_parse;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use history::{HistoryStore, NameOffenderMetrics, PidKey, ProcessSample};
+use app_state::{
+    App, GraphHeatSettings, OffenderSort, SETTINGS_FIELDS, SettingsModalState, TableMode,
+};
+use crossterm::event::{self, Event};
+#[cfg(test)]
+use crossterm::event::{KeyCode, KeyEvent};
+#[cfg(test)]
+use graph::GraphRange;
+use graph::{
+    GRAPH_ACTIVITY_EPSILON, braille_history_lines_optional_with_scale,
+    braille_history_lines_with_scale, graph_scale_bounds, graph_scale_bounds_optional,
+    history_viewport_samples, history_viewport_samples_deque,
+};
+use history::PidKey;
 use ratatui::{
     DefaultTerminal,
     prelude::*,
     widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
+#[cfg(test)]
+use top_parse::{ProcRow, snapshot_from_rows};
+use top_parse::{Snapshot, TopStreamParser, fetch_snapshot};
 
 const TOP_BIN: &str = "top";
-const TOP_ARGS: [&str; 8] = [
-    "-l",
-    "2",
-    "-s",
-    "0",
-    "-o",
-    "power",
-    "-stats",
-    "pid,command,power",
-];
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const REDRAW_EVERY: Duration = Duration::from_millis(120);
 const COLLECTOR_POLL_EVERY: Duration = Duration::from_millis(200);
@@ -49,33 +58,6 @@ const COLOR_GREEN: Color = Color::Rgb(0x98, 0xc3, 0x79);
 const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const COLOR_ORANGE: Color = Color::Rgb(0xd1, 0x9a, 0x66);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
-const GRAPH_ACTIVITY_EPSILON: f64 = 1e-3;
-const MAX_REASONABLE_POWER: f64 = 10_000.0;
-
-const BRAILLE_5X5: [char; 25] = [
-    ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
-    '⣾', '⡇', '⣇', '⣧', '⣷', '⣿',
-];
-#[derive(Debug, Clone)]
-struct ProcRow {
-    pid: i32,
-    process: String,
-    process_lc: String,
-    power: String,
-    power_num: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Snapshot {
-    rows: Vec<ProcRow>,
-    total_power: f64,
-}
-
-#[derive(Debug, Clone)]
-struct PinnedProcess {
-    pid: i32,
-    process: String,
-}
 
 #[derive(Debug)]
 enum CollectorCommand {
@@ -100,1193 +82,6 @@ struct SamplerRuntime {
     child: Child,
     events: Receiver<SamplerEvent>,
     reader: thread::JoinHandle<()>,
-}
-
-#[derive(Default)]
-struct TopStreamParser {
-    excluded_pids: Vec<i32>,
-    in_table: bool,
-    skipped_warmup: bool,
-    rows: Vec<ProcRow>,
-}
-
-impl TopStreamParser {
-    fn new(excluded_pids: Vec<i32>) -> Self {
-        Self {
-            excluded_pids,
-            in_table: false,
-            skipped_warmup: false,
-            rows: Vec::new(),
-        }
-    }
-
-    fn push_line(&mut self, line: &str) -> Result<Option<Snapshot>, String> {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("PID") {
-            let finished = self.finish_frame();
-            self.in_table = true;
-            return Ok(finished);
-        }
-
-        if !self.in_table {
-            return Ok(None);
-        }
-
-        if trimmed.is_empty() {
-            return Ok(self.finish_frame());
-        }
-
-        let first = trimmed.chars().next().unwrap_or(' ');
-        if !first.is_ascii_digit() {
-            return Ok(self.finish_frame());
-        }
-
-        let row =
-            parse_row(trimmed).ok_or_else(|| format!("unable to parse top row: {trimmed}"))?;
-
-        if !self.excluded_pids.contains(&row.pid) {
-            self.rows.push(row);
-        }
-
-        Ok(None)
-    }
-
-    fn finish_stream(&mut self) -> Option<Snapshot> {
-        self.finish_frame()
-    }
-
-    fn finish_frame(&mut self) -> Option<Snapshot> {
-        if !self.in_table {
-            return None;
-        }
-
-        self.in_table = false;
-        let rows = std::mem::take(&mut self.rows);
-
-        if !self.skipped_warmup {
-            self.skipped_warmup = true;
-            return None;
-        }
-
-        Some(snapshot_from_rows(rows))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct GraphHeatSettings {
-    yellow_start: f64,
-    orange_start: f64,
-    red_start: f64,
-}
-
-impl Default for GraphHeatSettings {
-    fn default() -> Self {
-        Self {
-            yellow_start: 40.0,
-            orange_start: 85.0,
-            red_start: 140.0,
-        }
-    }
-}
-
-impl GraphHeatSettings {
-    fn validate(&self) -> Result<(), String> {
-        let values = [self.yellow_start, self.orange_start, self.red_start];
-        if values
-            .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
-        {
-            return Err("thresholds must be finite numbers >= 0".to_string());
-        }
-
-        if !(self.yellow_start < self.orange_start && self.orange_start < self.red_start) {
-            return Err("thresholds must satisfy yellow < orange < red".to_string());
-        }
-
-        Ok(())
-    }
-
-    fn color_for_power(&self, power: f64) -> Color {
-        if power >= self.red_start {
-            COLOR_RED
-        } else if power >= self.orange_start {
-            COLOR_ORANGE
-        } else if power >= self.yellow_start {
-            COLOR_YELLOW
-        } else {
-            COLOR_GREEN
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct AppSettings {
-    graph_heat: GraphHeatSettings,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsField {
-    YellowStart,
-    OrangeStart,
-    RedStart,
-}
-
-const SETTINGS_FIELDS: [SettingsField; 3] = [
-    SettingsField::YellowStart,
-    SettingsField::OrangeStart,
-    SettingsField::RedStart,
-];
-
-impl SettingsField {
-    fn label(self) -> &'static str {
-        match self {
-            SettingsField::YellowStart => "yellow start",
-            SettingsField::OrangeStart => "orange start",
-            SettingsField::RedStart => "red start",
-        }
-    }
-
-    fn value(self, settings: &AppSettings) -> f64 {
-        match self {
-            SettingsField::YellowStart => settings.graph_heat.yellow_start,
-            SettingsField::OrangeStart => settings.graph_heat.orange_start,
-            SettingsField::RedStart => settings.graph_heat.red_start,
-        }
-    }
-
-    fn set_value(self, settings: &mut AppSettings, value: f64) {
-        match self {
-            SettingsField::YellowStart => settings.graph_heat.yellow_start = value,
-            SettingsField::OrangeStart => settings.graph_heat.orange_start = value,
-            SettingsField::RedStart => settings.graph_heat.red_start = value,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct SettingsEditState {
-    field: SettingsField,
-    buffer: String,
-}
-
-#[derive(Debug, Clone)]
-struct SettingsModalState {
-    draft: AppSettings,
-    selected: usize,
-    editing: Option<SettingsEditState>,
-    error: Option<String>,
-}
-
-impl SettingsModalState {
-    fn new(current: &AppSettings) -> Self {
-        Self {
-            draft: current.clone(),
-            selected: 0,
-            editing: None,
-            error: None,
-        }
-    }
-
-    fn selected_field(&self) -> SettingsField {
-        SETTINGS_FIELDS[self.selected.min(SETTINGS_FIELDS.len().saturating_sub(1))]
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        if SETTINGS_FIELDS.is_empty() {
-            self.selected = 0;
-            return;
-        }
-
-        let len = SETTINGS_FIELDS.len() as isize;
-        let current = self.selected as isize;
-        self.selected = (current + delta).rem_euclid(len) as usize;
-    }
-
-    fn start_edit(&mut self) {
-        let field = self.selected_field();
-        let value = field.value(&self.draft);
-        self.editing = Some(SettingsEditState {
-            field,
-            buffer: format_setting_value(value),
-        });
-        self.error = None;
-    }
-
-    fn display_value(&self, field: SettingsField) -> String {
-        if let Some(edit) = self.editing.as_ref() {
-            if edit.field == field {
-                return edit.buffer.clone();
-            }
-        }
-
-        format_setting_value(field.value(&self.draft))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableMode {
-    Processes,
-    Offenders,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OffenderSort {
-    Current,
-    Avg2m,
-    Peak,
-    Share,
-}
-
-impl OffenderSort {
-    fn next(self) -> Self {
-        match self {
-            Self::Current => Self::Avg2m,
-            Self::Avg2m => Self::Peak,
-            Self::Peak => Self::Share,
-            Self::Share => Self::Current,
-        }
-    }
-
-    fn title_label(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::Avg2m => "avg2m",
-            Self::Peak => "peak",
-            Self::Share => "share",
-        }
-    }
-
-    fn sort_by_label(self) -> &'static str {
-        match self {
-            Self::Current => "NOW↓",
-            Self::Avg2m => "AVG2M↓",
-            Self::Peak => "PEAK↓",
-            Self::Share => "SHARE↓",
-        }
-    }
-
-    fn header_label(self, column: Self, default: &'static str) -> &'static str {
-        if self == column {
-            self.sort_by_label()
-        } else {
-            default
-        }
-    }
-
-    fn compare(self, a: &NameOffenderMetrics, b: &NameOffenderMetrics) -> Ordering {
-        let primary = match self {
-            Self::Current => b.current.partial_cmp(&a.current),
-            Self::Avg2m => b.avg.partial_cmp(&a.avg),
-            Self::Peak => b.peak.partial_cmp(&a.peak),
-            Self::Share => b.share.partial_cmp(&a.share),
-        }
-        .unwrap_or(Ordering::Equal);
-
-        primary
-            .then_with(|| b.current.partial_cmp(&a.current).unwrap_or(Ordering::Equal))
-            .then_with(|| b.avg.partial_cmp(&a.avg).unwrap_or(Ordering::Equal))
-            .then_with(|| b.peak.partial_cmp(&a.peak).unwrap_or(Ordering::Equal))
-            .then_with(|| b.share.partial_cmp(&a.share).unwrap_or(Ordering::Equal))
-            .then_with(|| a.name.cmp(&b.name))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraphRange {
-    Minutes8,
-    Minutes30,
-    Hours3,
-    Hours12,
-}
-
-impl GraphRange {
-    fn next(self) -> Self {
-        match self {
-            Self::Minutes8 => Self::Minutes30,
-            Self::Minutes30 => Self::Hours3,
-            Self::Hours3 => Self::Hours12,
-            Self::Hours12 => Self::Minutes8,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Minutes8 => "8m",
-            Self::Minutes30 => "30m",
-            Self::Hours3 => "3h",
-            Self::Hours12 => "12h",
-        }
-    }
-
-    fn archive_range(self) -> Option<persistence::ArchiveGraphRange> {
-        match self {
-            Self::Minutes8 => None,
-            Self::Minutes30 => Some(persistence::ArchiveGraphRange::Minutes30),
-            Self::Hours3 => Some(persistence::ArchiveGraphRange::Hours3),
-            Self::Hours12 => Some(persistence::ArchiveGraphRange::Hours12),
-        }
-    }
-}
-
-enum MainGraphSamples {
-    Live(Vec<f64>),
-    Archive(Vec<Option<f64>>),
-}
-
-struct App {
-    snapshot: Snapshot,
-    last_error: Option<String>,
-    loading: bool,
-    paused: bool,
-    settings: AppSettings,
-    settings_modal: Option<SettingsModalState>,
-    pinned: Option<PinnedProcess>,
-    offender_pinned: Option<String>,
-    process_selected: usize,
-    process_scroll: usize,
-    process_filter_query: String,
-    process_filter_input: Option<String>,
-    offender_selected: usize,
-    offender_scroll: usize,
-    offender_filter_query: String,
-    offender_filter_input: Option<String>,
-    power_history: VecDeque<f64>,
-    live_snapshot_history: VecDeque<persistence::LiveSnapshot>,
-    archive: persistence::ArchiveState,
-    process_visible_indices: Vec<usize>,
-    process_visible_dirty: bool,
-    offender_rows: Vec<NameOffenderMetrics>,
-    offender_visible_indices: Vec<usize>,
-    offender_visible_dirty: bool,
-    offender_sort: OffenderSort,
-    graph_range: GraphRange,
-    show_graph: bool,
-    show_table: bool,
-    table_mode: TableMode,
-    tick: u64,
-    history_store: HistoryStore,
-}
-
-impl App {
-    fn new() -> Self {
-        let mut app = Self {
-            snapshot: Snapshot::default(),
-            last_error: None,
-            loading: true,
-            paused: false,
-            settings: AppSettings::default(),
-            settings_modal: None,
-            pinned: None,
-            offender_pinned: None,
-            process_selected: 0,
-            process_scroll: 0,
-            process_filter_query: String::new(),
-            process_filter_input: None,
-            offender_selected: 0,
-            offender_scroll: 0,
-            offender_filter_query: String::new(),
-            offender_filter_input: None,
-            power_history: VecDeque::with_capacity(HISTORY_LIMIT),
-            live_snapshot_history: VecDeque::with_capacity(HISTORY_LIMIT),
-            archive: persistence::ArchiveState::default(),
-            process_visible_indices: Vec::new(),
-            process_visible_dirty: true,
-            offender_rows: Vec::new(),
-            offender_visible_indices: Vec::new(),
-            offender_visible_dirty: true,
-            offender_sort: OffenderSort::Current,
-            graph_range: GraphRange::Minutes8,
-            show_graph: true,
-            show_table: true,
-            table_mode: TableMode::Processes,
-            tick: 0,
-            history_store: HistoryStore::new(HISTORY_LIMIT, HISTORY_STALE_TICKS),
-        };
-
-        let process_visible_len = app.process_visible_len();
-        app.normalize_process_selection(process_visible_len);
-        let offender_visible_len = app.offender_visible_len();
-        app.normalize_offender_selection(offender_visible_len);
-        app
-    }
-
-    fn process_active_filter(&self) -> &str {
-        self.process_filter_input
-            .as_deref()
-            .unwrap_or(self.process_filter_query.as_str())
-    }
-
-    fn offender_active_filter(&self) -> &str {
-        self.offender_filter_input
-            .as_deref()
-            .unwrap_or(self.offender_filter_query.as_str())
-    }
-
-    fn is_filter_input_active(&self) -> bool {
-        match self.table_mode {
-            TableMode::Processes => self.process_filter_input.is_some(),
-            TableMode::Offenders => self.offender_filter_input.is_some(),
-        }
-    }
-
-    fn mark_process_visible_dirty(&mut self) {
-        self.process_visible_dirty = true;
-    }
-
-    fn mark_offender_visible_dirty(&mut self) {
-        self.offender_visible_dirty = true;
-    }
-
-    fn rebuild_process_visible_if_needed(&mut self) {
-        if !self.process_visible_dirty {
-            return;
-        }
-
-        let filter_lc = self.process_active_filter().trim().to_lowercase();
-        let has_filter = !filter_lc.is_empty();
-
-        self.process_visible_indices.clear();
-        self.process_visible_indices.reserve(
-            self.snapshot
-                .rows
-                .len()
-                .saturating_sub(self.process_visible_indices.len()),
-        );
-
-        for (idx, row) in self.snapshot.rows.iter().enumerate() {
-            let matches = if !has_filter {
-                true
-            } else {
-                row.process_lc.contains(&filter_lc) || row.pid.to_string().contains(&filter_lc)
-            };
-
-            if matches {
-                self.process_visible_indices.push(idx);
-            }
-        }
-
-        self.process_visible_indices.sort_by(|a, b| {
-            let ra = &self.snapshot.rows[*a];
-            let rb = &self.snapshot.rows[*b];
-
-            rb.power_num
-                .partial_cmp(&ra.power_num)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| ra.process.cmp(&rb.process))
-        });
-
-        self.process_visible_dirty = false;
-    }
-
-    fn rebuild_offender_visible_if_needed(&mut self) {
-        if !self.offender_visible_dirty {
-            return;
-        }
-
-        self.offender_rows = self
-            .history_store
-            .top_name_offenders(
-                self.tick,
-                OFFENDER_AVG_WINDOW_TICKS,
-                OFFENDER_PEAK_WINDOW_TICKS,
-                self.snapshot.total_power,
-                usize::MAX,
-            )
-            .into_iter()
-            .filter(|offender| {
-                offender.current > GRAPH_ACTIVITY_EPSILON
-                    || offender.avg > GRAPH_ACTIVITY_EPSILON
-                    || offender.peak > GRAPH_ACTIVITY_EPSILON
-            })
-            .collect();
-
-        self.offender_rows
-            .sort_by(|a, b| self.offender_sort.compare(a, b));
-
-        let filter_lc = self.offender_active_filter().trim().to_lowercase();
-        let has_filter = !filter_lc.is_empty();
-
-        self.offender_visible_indices.clear();
-        self.offender_visible_indices.reserve(
-            self.offender_rows
-                .len()
-                .saturating_sub(self.offender_visible_indices.len()),
-        );
-
-        for (idx, offender) in self.offender_rows.iter().enumerate() {
-            let matches = if !has_filter {
-                true
-            } else {
-                offender.name.to_lowercase().contains(&filter_lc)
-            };
-
-            if matches {
-                self.offender_visible_indices.push(idx);
-            }
-        }
-
-        self.offender_visible_dirty = false;
-    }
-
-    fn process_visible_len(&mut self) -> usize {
-        self.rebuild_process_visible_if_needed();
-        self.process_visible_indices.len()
-    }
-
-    fn offender_visible_len(&mut self) -> usize {
-        self.rebuild_offender_visible_if_needed();
-        self.offender_visible_indices.len()
-    }
-
-    fn visible_len(&mut self) -> usize {
-        match self.table_mode {
-            TableMode::Processes => self.process_visible_len(),
-            TableMode::Offenders => self.offender_visible_len(),
-        }
-    }
-
-    fn normalize_process_selection(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            self.process_selected = 0;
-            self.process_scroll = 0;
-            return;
-        }
-
-        if self.process_selected >= visible_len {
-            self.process_selected = visible_len - 1;
-        }
-
-        if self.process_scroll > self.process_selected {
-            self.process_scroll = self.process_selected;
-        }
-    }
-
-    fn normalize_offender_selection(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            self.offender_selected = 0;
-            self.offender_scroll = 0;
-            return;
-        }
-
-        if self.offender_selected >= visible_len {
-            self.offender_selected = visible_len - 1;
-        }
-
-        if self.offender_scroll > self.offender_selected {
-            self.offender_scroll = self.offender_selected;
-        }
-    }
-
-    fn normalize_selection(&mut self, visible_len: usize) {
-        match self.table_mode {
-            TableMode::Processes => self.normalize_process_selection(visible_len),
-            TableMode::Offenders => self.normalize_offender_selection(visible_len),
-        }
-    }
-
-    fn record_history(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-        self.power_history.push_back(self.snapshot.total_power);
-
-        while self.power_history.len() > HISTORY_LIMIT {
-            let _ = self.power_history.pop_front();
-        }
-
-        let mut live_samples = Vec::with_capacity(self.snapshot.rows.len());
-        let mut grouped_totals: HashMap<String, f64> = HashMap::new();
-
-        for row in &self.snapshot.rows {
-            live_samples.push(persistence::LiveProcessSample {
-                pid: row.pid,
-                process: row.process.clone(),
-                power: row.power_num,
-            });
-            *grouped_totals.entry(row.process.clone()).or_insert(0.0) += row.power_num;
-        }
-
-        self.history_store.update(
-            self.tick,
-            live_samples.iter().map(|sample| ProcessSample {
-                pid: sample.pid,
-                process: sample.process.as_str(),
-                power: sample.power,
-            }),
-        );
-
-        self.live_snapshot_history
-            .push_back(persistence::LiveSnapshot {
-                tick: self.tick,
-                samples: live_samples,
-            });
-        while self.live_snapshot_history.len() > HISTORY_LIMIT {
-            let _ = self.live_snapshot_history.pop_front();
-        }
-
-        self.archive.record_sample(
-            persistence::unix_time_secs_now(),
-            persistence::continuity_threshold_secs(REFRESH_EVERY),
-            self.snapshot.total_power,
-            grouped_totals.into_iter(),
-        );
-    }
-
-    fn rebuild_history_store_from_live_snapshots(&mut self) {
-        let mut store = HistoryStore::new(HISTORY_LIMIT, HISTORY_STALE_TICKS);
-
-        for snapshot in &self.live_snapshot_history {
-            store.update(
-                snapshot.tick,
-                snapshot.samples.iter().map(|sample| ProcessSample {
-                    pid: sample.pid,
-                    process: sample.process.as_str(),
-                    power: sample.power,
-                }),
-            );
-        }
-
-        self.history_store = store;
-    }
-
-    fn apply_loaded_session_cache(&mut self, loaded: persistence::LoadedSessionCache) {
-        let persistence::LoadedSessionCache {
-            mut cache,
-            gap_millis: _gap_millis,
-            hydrate_live,
-        } = loaded;
-
-        self.archive = cache.archive;
-
-        if !hydrate_live {
-            // Restore the archive foundation, but leave live buffers empty so the UI does
-            // not imply sampling continued across a real downtime gap.
-            return;
-        }
-
-        if cache.live_power_history.len() > HISTORY_LIMIT {
-            let drop = cache.live_power_history.len() - HISTORY_LIMIT;
-            cache.live_power_history.drain(0..drop);
-        }
-
-        cache.live_snapshots.sort_by_key(|snapshot| snapshot.tick);
-        if cache.live_snapshots.len() > HISTORY_LIMIT {
-            let drop = cache.live_snapshots.len() - HISTORY_LIMIT;
-            cache.live_snapshots.drain(0..drop);
-        }
-
-        self.power_history = VecDeque::from(cache.live_power_history);
-        self.live_snapshot_history = VecDeque::from(cache.live_snapshots);
-        self.tick = cache.last_tick;
-        if let Some(last_tick) = self
-            .live_snapshot_history
-            .back()
-            .map(|snapshot| snapshot.tick)
-        {
-            self.tick = self.tick.max(last_tick);
-        }
-
-        self.rebuild_history_store_from_live_snapshots();
-
-        if let Some(last_snapshot) = self.live_snapshot_history.back() {
-            self.snapshot = snapshot_from_live_snapshot(last_snapshot);
-            self.loading = false;
-            self.last_error = None;
-            self.mark_process_visible_dirty();
-            self.mark_offender_visible_dirty();
-            let process_visible_len = self.process_visible_len();
-            self.normalize_process_selection(process_visible_len);
-            let offender_visible_len = self.offender_visible_len();
-            self.normalize_offender_selection(offender_visible_len);
-        }
-    }
-
-    fn to_session_cache(&self) -> persistence::SessionCache {
-        persistence::SessionCache {
-            saved_at_unix_millis: persistence::unix_time_millis_now(),
-            last_tick: self.tick,
-            live_power_history: self.power_history.iter().copied().collect(),
-            live_snapshots: self.live_snapshot_history.iter().cloned().collect(),
-            archive: self.archive.clone(),
-        }
-    }
-
-    fn cycle_graph_range(&mut self) {
-        self.graph_range = self.graph_range.next();
-    }
-
-    fn main_graph_samples_for_width(&self, graph_width: usize, now_secs: u64) -> MainGraphSamples {
-        match self.graph_range.archive_range() {
-            None => MainGraphSamples::Live(history_viewport_samples_deque(
-                &self.power_history,
-                graph_width,
-            )),
-            Some(archive_range) => MainGraphSamples::Archive(self.archive.graph_samples_for_range(
-                archive_range,
-                graph_width,
-                now_secs,
-            )),
-        }
-    }
-
-    fn graph_scale_bounds_for_viewport(&self, samples: &[f64]) -> (f64, f64) {
-        graph_scale_bounds(samples)
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let len = self.visible_len();
-        if len == 0 {
-            match self.table_mode {
-                TableMode::Processes => {
-                    self.process_selected = 0;
-                    self.process_scroll = 0;
-                }
-                TableMode::Offenders => {
-                    self.offender_selected = 0;
-                    self.offender_scroll = 0;
-                }
-            }
-            return;
-        }
-
-        let current = match self.table_mode {
-            TableMode::Processes => self.process_selected,
-            TableMode::Offenders => self.offender_selected,
-        };
-        let max = (len - 1) as isize;
-        let next = (current as isize + delta).clamp(0, max) as usize;
-
-        match self.table_mode {
-            TableMode::Processes => self.process_selected = next,
-            TableMode::Offenders => self.offender_selected = next,
-        }
-    }
-
-    fn select_top(&mut self) {
-        match self.table_mode {
-            TableMode::Processes => {
-                self.process_selected = 0;
-                self.process_scroll = 0;
-            }
-            TableMode::Offenders => {
-                self.offender_selected = 0;
-                self.offender_scroll = 0;
-            }
-        }
-    }
-
-    fn select_bottom(&mut self) {
-        let len = self.visible_len();
-        match self.table_mode {
-            TableMode::Processes => {
-                if len == 0 {
-                    self.process_selected = 0;
-                    self.process_scroll = 0;
-                } else {
-                    self.process_selected = len - 1;
-                }
-            }
-            TableMode::Offenders => {
-                if len == 0 {
-                    self.offender_selected = 0;
-                    self.offender_scroll = 0;
-                } else {
-                    self.offender_selected = len - 1;
-                }
-            }
-        }
-    }
-
-    fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
-    }
-
-    fn is_process_table_mode(&self) -> bool {
-        self.table_mode == TableMode::Processes
-    }
-
-    fn toggle_table_mode(&mut self) {
-        self.table_mode = match self.table_mode {
-            TableMode::Processes => TableMode::Offenders,
-            TableMode::Offenders => TableMode::Processes,
-        };
-    }
-
-    fn selected_offender_name(&mut self) -> Option<String> {
-        self.rebuild_offender_visible_if_needed();
-        let idx = self
-            .offender_visible_indices
-            .get(self.offender_selected)
-            .copied()?;
-        self.offender_rows
-            .get(idx)
-            .map(|offender| offender.name.clone())
-    }
-
-    fn restore_offender_selection_by_name(&mut self, selected_name: Option<String>) {
-        self.rebuild_offender_visible_if_needed();
-
-        if let Some(name) = selected_name {
-            if let Some(next_selected) = self
-                .offender_visible_indices
-                .iter()
-                .position(|idx| self.offender_rows[*idx].name == name)
-            {
-                self.offender_selected = next_selected;
-            }
-        }
-
-        self.normalize_offender_selection(self.offender_visible_indices.len());
-    }
-
-    fn cycle_offender_sort(&mut self) {
-        let selected_name = self.selected_offender_name();
-        self.offender_sort = self.offender_sort.next();
-        self.mark_offender_visible_dirty();
-        self.restore_offender_selection_by_name(selected_name);
-    }
-
-    fn is_pinned(&self) -> bool {
-        self.is_process_table_mode() && self.pinned.is_some()
-    }
-
-    fn is_offender_pinned(&self) -> bool {
-        self.table_mode == TableMode::Offenders && self.offender_pinned.is_some()
-    }
-
-    fn toggle_pin(&mut self) {
-        if !self.is_process_table_mode() {
-            return;
-        }
-
-        if self.pinned.is_some() {
-            self.pinned = None;
-            return;
-        }
-
-        self.rebuild_process_visible_if_needed();
-        let Some(snapshot_idx) = self
-            .process_visible_indices
-            .get(self.process_selected)
-            .copied()
-        else {
-            return;
-        };
-
-        if let Some(row) = self.snapshot.rows.get(snapshot_idx) {
-            self.pinned = Some(PinnedProcess {
-                pid: row.pid,
-                process: row.process.clone(),
-            });
-        }
-    }
-
-    fn toggle_offender_pin(&mut self) {
-        if self.table_mode != TableMode::Offenders {
-            return;
-        }
-
-        if self.offender_pinned.is_some() {
-            self.offender_pinned = None;
-            return;
-        }
-
-        self.offender_pinned = self.selected_offender_name();
-    }
-
-    fn open_settings_modal(&mut self) {
-        self.settings_modal = Some(SettingsModalState::new(&self.settings));
-    }
-
-    fn handle_settings_key(&mut self, key: KeyEvent) {
-        let mut close_modal = false;
-        let mut apply_settings: Option<AppSettings> = None;
-
-        let Some(modal) = self.settings_modal.as_mut() else {
-            return;
-        };
-
-        if let Some(edit) = modal.editing.as_mut() {
-            match key.code {
-                KeyCode::Esc => {
-                    modal.editing = None;
-                    modal.error = None;
-                }
-                KeyCode::Enter => {
-                    let parsed = edit.buffer.trim().parse::<f64>();
-                    match parsed {
-                        Ok(value) if value.is_finite() && value >= 0.0 => {
-                            edit.field.set_value(&mut modal.draft, value);
-                            modal.editing = None;
-                            modal.error = None;
-                        }
-                        Ok(_) => {
-                            modal.error = Some("value must be a finite number >= 0".to_string());
-                        }
-                        Err(_) => {
-                            modal.error = Some("invalid number".to_string());
-                        }
-                    }
-                }
-                KeyCode::Backspace => {
-                    edit.buffer.pop();
-                    modal.error = None;
-                }
-                KeyCode::Char(ch)
-                    if ch.is_ascii_digit()
-                        || ch == '.'
-                        || (ch == '-' && edit.buffer.is_empty()) =>
-                {
-                    edit.buffer.push(ch);
-                    modal.error = None;
-                }
-                _ => {}
-            }
-        } else {
-            match key.code {
-                KeyCode::Esc => {
-                    close_modal = true;
-                }
-                KeyCode::Char('m') | KeyCode::Char('M') => {
-                    match modal.draft.graph_heat.validate() {
-                        Ok(()) => {
-                            apply_settings = Some(modal.draft.clone());
-                            close_modal = true;
-                        }
-                        Err(err) => {
-                            modal.error = Some(err);
-                        }
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    modal.move_selection(1);
-                    modal.error = None;
-                }
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                    modal.move_selection(-1);
-                    modal.error = None;
-                }
-                KeyCode::Enter => {
-                    modal.start_edit();
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(next_settings) = apply_settings {
-            self.settings = next_settings;
-        }
-
-        if close_modal {
-            self.settings_modal = None;
-        }
-    }
-
-    fn start_filter_input(&mut self) {
-        match self.table_mode {
-            TableMode::Processes => {
-                self.process_filter_input = Some(self.process_filter_query.clone());
-                self.mark_process_visible_dirty();
-            }
-            TableMode::Offenders => {
-                self.offender_filter_input = Some(self.offender_filter_query.clone());
-                self.mark_offender_visible_dirty();
-            }
-        }
-    }
-
-    fn handle_filter_key(&mut self, key: KeyEvent) {
-        match self.table_mode {
-            TableMode::Processes => {
-                let Some(buf) = self.process_filter_input.as_mut() else {
-                    return;
-                };
-
-                let mut touched_filter = false;
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.process_filter_input = None;
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Enter => {
-                        self.process_filter_query = buf.clone();
-                        self.process_filter_input = None;
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Char(ch) => {
-                        buf.push(ch);
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    _ => {}
-                }
-
-                if touched_filter {
-                    self.mark_process_visible_dirty();
-                }
-
-                let visible_len = self.process_visible_len();
-                self.normalize_process_selection(visible_len);
-            }
-            TableMode::Offenders => {
-                let Some(buf) = self.offender_filter_input.as_mut() else {
-                    return;
-                };
-
-                let mut touched_filter = false;
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.offender_filter_input = None;
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Enter => {
-                        self.offender_filter_query = buf.clone();
-                        self.offender_filter_input = None;
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Char(ch) => {
-                        buf.push(ch);
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    _ => {}
-                }
-
-                if touched_filter {
-                    self.mark_offender_visible_dirty();
-                }
-
-                let visible_len = self.offender_visible_len();
-                self.normalize_offender_selection(visible_len);
-            }
-        }
-    }
-
-    fn apply_snapshot(&mut self, next: Snapshot) {
-        let selected_offender_name = self.selected_offender_name();
-
-        self.snapshot = next;
-        self.last_error = None;
-        self.loading = false;
-        self.mark_process_visible_dirty();
-        self.mark_offender_visible_dirty();
-        self.record_history();
-
-        let process_visible_len = self.process_visible_len();
-        self.normalize_process_selection(process_visible_len);
-        self.restore_offender_selection_by_name(selected_offender_name);
-    }
-
-    fn apply_refresh_error(&mut self, err: String) {
-        self.loading = false;
-        self.last_error = Some(format!("refresh failed: {err}"));
-    }
-
-    fn apply_collector_event(&mut self, event: CollectorEvent) {
-        match event {
-            CollectorEvent::Snapshot(next) => self.apply_snapshot(next),
-            CollectorEvent::Error(err) => self.apply_refresh_error(err),
-        }
-    }
-
-    fn status_hint_text(&self) -> &'static str {
-        if self.settings_modal.is_some() {
-            "Enter edit • Esc cancel"
-        } else if self.is_filter_input_active() {
-            "Enter apply • Esc cancel"
-        } else if self.table_mode == TableMode::Offenders {
-            if self.offender_pinned.is_some() {
-                "Enter unpin • / filter • s sort • 3 processes • 4 range • space pause"
-            } else {
-                "j/k move • g/G jump • / filter • Enter pin • s sort • 3 processes • 4 range • space pause"
-            }
-        } else if self.pinned.is_some() {
-            "Enter unpin • / filter • 3 offenders • 4 range • space pause"
-        } else {
-            "j/k move • g/G jump • / filter • Enter pin • 3 offenders • 4 range • space pause"
-        }
-    }
-
-    fn status_hint_chips(&self) -> Vec<(&'static str, char)> {
-        if self.settings_modal.is_some() {
-            vec![("menu", 'm')]
-        } else if self.is_filter_input_active() {
-            vec![]
-        } else {
-            vec![("menu", 'm'), ("filter /", '/'), ("quit", 'q')]
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press {
-            return false;
-        }
-
-        if self.settings_modal.is_some() {
-            self.handle_settings_key(key);
-            return false;
-        }
-
-        if self.is_filter_input_active() {
-            self.handle_filter_key(key);
-            return false;
-        }
-
-        let can_navigate = match self.table_mode {
-            TableMode::Processes => !self.is_pinned(),
-            TableMode::Offenders => !self.is_offender_pinned(),
-        };
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
-            KeyCode::Char('j') | KeyCode::Down if can_navigate => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up if can_navigate => self.move_selection(-1),
-            KeyCode::Char('g') if can_navigate => self.select_top(),
-            KeyCode::Char('G') if can_navigate => self.select_bottom(),
-            KeyCode::Char('/') => self.start_filter_input(),
-            KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
-            KeyCode::Char('1') => self.show_graph = !self.show_graph,
-            KeyCode::Char('2') => self.show_table = !self.show_table,
-            KeyCode::Char('3') => self.toggle_table_mode(),
-            KeyCode::Char('4') => self.cycle_graph_range(),
-            KeyCode::Char('s') | KeyCode::Char('S') if self.table_mode == TableMode::Offenders => {
-                self.cycle_offender_sort();
-            }
-            KeyCode::Enter => match self.table_mode {
-                TableMode::Processes => self.toggle_pin(),
-                TableMode::Offenders => self.toggle_offender_pin(),
-            },
-            _ => {}
-        }
-
-        let visible_len = self.visible_len();
-        self.normalize_selection(visible_len);
-        false
-    }
 }
 
 fn main() -> io::Result<()> {
@@ -1791,436 +586,8 @@ fn hotkey_hint_line(hint: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn format_setting_value(value: f64) -> String {
-    let mut s = format!("{value:.1}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-
-    if s.is_empty() { "0".to_string() } else { s }
-}
-
-fn history_range(values: &[f64]) -> Option<(f64, f64)> {
-    let mut iter = values.iter().copied();
-    let first = iter.next()?;
-
-    let mut min = first;
-    let mut max = first;
-
-    for value in iter {
-        min = min.min(value);
-        max = max.max(value);
-    }
-
-    Some((min, max))
-}
-
-fn history_viewport_samples(values: &[f64], width: usize) -> Vec<f64> {
-    let points = width.saturating_mul(2);
-    if points == 0 {
-        return Vec::new();
-    }
-
-    if values.is_empty() {
-        return vec![0.0; points];
-    }
-
-    if values.len() >= points {
-        return values[values.len() - points..].to_vec();
-    }
-
-    let mut samples = vec![0.0; points];
-    let start = points - values.len();
-    samples[start..].copy_from_slice(values);
-    samples
-}
-
-fn history_viewport_samples_deque(values: &VecDeque<f64>, width: usize) -> Vec<f64> {
-    let points = width.saturating_mul(2);
-    if points == 0 {
-        return Vec::new();
-    }
-
-    if values.is_empty() {
-        return vec![0.0; points];
-    }
-
-    let tail_len = values.len().min(points);
-    let mut samples = vec![0.0; points];
-    let start = points - tail_len;
-
-    for (dst, value) in samples[start..]
-        .iter_mut()
-        .zip(values.iter().skip(values.len() - tail_len))
-    {
-        *dst = *value;
-    }
-
-    samples
-}
-
-fn history_viewport_samples_optional(values: &[Option<f64>], width: usize) -> Vec<Option<f64>> {
-    let points = width.saturating_mul(2);
-    if points == 0 {
-        return Vec::new();
-    }
-
-    if values.is_empty() {
-        return vec![None; points];
-    }
-
-    if values.len() >= points {
-        return values[values.len() - points..].to_vec();
-    }
-
-    let mut samples = vec![None; points];
-    let start = points - values.len();
-    samples[start..].clone_from_slice(values);
-    samples
-}
-
-fn history_range_optional(values: &[Option<f64>]) -> Option<(f64, f64)> {
-    let mut iter = values.iter().flatten().copied();
-    let first = iter.next()?;
-
-    let mut min = first;
-    let mut max = first;
-
-    for value in iter {
-        min = min.min(value);
-        max = max.max(value);
-    }
-
-    Some((min, max))
-}
-
-fn graph_scale_bounds_optional(values: &[Option<f64>]) -> (f64, f64) {
-    let (raw_min, raw_max) = history_range_optional(values).unwrap_or((0.0, 0.0));
-
-    if raw_max <= 0.0 {
-        return (0.0, 1.0);
-    }
-
-    let span = (raw_max - raw_min).max(0.0);
-    let target_span = (raw_max * 0.25).max(1.0);
-
-    let base_max = if span < target_span {
-        raw_max + (target_span - span) * 0.5
-    } else {
-        raw_max
-    };
-
-    let adjusted_max = (base_max * 1.35).max(raw_max + 5.0);
-
-    (0.0, adjusted_max.max(1.0))
-}
-
-fn graph_scale_bounds(values: &[f64]) -> (f64, f64) {
-    let (raw_min, raw_max) = history_range(values).unwrap_or((0.0, 0.0));
-
-    if raw_max <= 0.0 {
-        return (0.0, 1.0);
-    }
-
-    let span = (raw_max - raw_min).max(0.0);
-    let target_span = (raw_max * 0.25).max(1.0);
-
-    let base_max = if span < target_span {
-        raw_max + (target_span - span) * 0.5
-    } else {
-        raw_max
-    };
-
-    let adjusted_max = (base_max * 1.35).max(raw_max + 5.0);
-
-    (0.0, adjusted_max.max(1.0))
-}
-
-fn value_to_vertical_steps(value: f64, min: f64, max: f64, rows: usize) -> i32 {
-    if rows == 0 || max <= min {
-        return 0;
-    }
-
-    let max_steps = (rows * 4) as i32;
-    let activity = (value - min).max(0.0);
-
-    if activity <= GRAPH_ACTIVITY_EPSILON {
-        return 0;
-    }
-
-    let normalized = (activity / (max - min)).clamp(0.0, 1.0);
-    ((normalized * max_steps as f64).round() as i32).max(1)
-}
-
 fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
     thresholds.color_for_power(power)
-}
-
-fn graph_span_style(color: Option<Color>) -> Style {
-    match color {
-        Some(color) => Style::default().fg(color),
-        None => Style::default(),
-    }
-}
-
-fn row_position_color(row_from_top: usize, height: usize) -> Color {
-    if height <= 1 {
-        return COLOR_GREEN;
-    }
-
-    let row_from_bottom = height - 1 - row_from_top;
-    let fraction = row_from_bottom as f64 / (height - 1) as f64;
-
-    if fraction >= 0.85 {
-        COLOR_RED
-    } else if fraction >= 0.65 {
-        COLOR_ORANGE
-    } else if fraction >= 0.40 {
-        COLOR_YELLOW
-    } else {
-        COLOR_GREEN
-    }
-}
-
-fn braille_history_cells_with_scale(
-    values: &[f64],
-    width: usize,
-    height: usize,
-    scale_min: f64,
-    scale_max: f64,
-) -> Vec<Vec<(char, Color)>> {
-    if height == 0 {
-        return Vec::new();
-    }
-
-    if width == 0 {
-        return vec![Vec::new(); height];
-    }
-
-    let samples = history_viewport_samples(values, width);
-
-    let steps: Vec<i32> = samples
-        .iter()
-        .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
-        .collect();
-
-    let mut rows = Vec::with_capacity(height);
-
-    for row_from_top in 0..height {
-        let row_from_bottom = height - 1 - row_from_top;
-        let row_base = (row_from_bottom * 4) as i32;
-        let row_color = row_position_color(row_from_top, height);
-
-        let mut line = Vec::with_capacity(width);
-        for col in 0..width {
-            let left_level = (steps[col * 2] - row_base).clamp(0, 4) as usize;
-            let right_level = (steps[col * 2 + 1] - row_base).clamp(0, 4) as usize;
-            line.push((BRAILLE_5X5[left_level * 5 + right_level], row_color));
-        }
-
-        rows.push(line);
-    }
-
-    let bottom_row_color = row_position_color(height - 1, height);
-    for col in 0..width {
-        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
-        if has_visible_segment {
-            continue;
-        }
-
-        let left_active = (samples[col * 2] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        let right_active = (samples[col * 2 + 1] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        if !left_active && !right_active {
-            continue;
-        }
-
-        rows[height - 1][col] = (
-            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
-            bottom_row_color,
-        );
-    }
-
-    rows
-}
-
-#[cfg(test)]
-fn braille_history_cells(values: &[f64], width: usize, height: usize) -> Vec<Vec<(char, Color)>> {
-    let samples = history_viewport_samples(values, width);
-    let (scale_min, scale_max) = graph_scale_bounds(&samples);
-    braille_history_cells_with_scale(values, width, height, scale_min, scale_max)
-}
-
-fn braille_history_lines_with_scale(
-    values: &[f64],
-    width: usize,
-    height: usize,
-    scale_min: f64,
-    scale_max: f64,
-) -> Vec<Line<'static>> {
-    braille_history_cells_with_scale(values, width, height, scale_min, scale_max)
-        .into_iter()
-        .map(|row| {
-            let mut spans: Vec<Span> = Vec::new();
-            let mut run = String::new();
-            let mut run_color: Option<Color> = None;
-
-            for (ch, cell_color) in row {
-                let color = if ch == ' ' { None } else { Some(cell_color) };
-
-                if color != run_color && !run.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut run),
-                        graph_span_style(run_color),
-                    ));
-                }
-
-                run.push(ch);
-                run_color = color;
-            }
-
-            if !run.is_empty() {
-                spans.push(Span::styled(run, graph_span_style(run_color)));
-            }
-
-            Line::from(spans)
-        })
-        .collect()
-}
-
-fn braille_history_cells_optional_with_scale(
-    values: &[Option<f64>],
-    width: usize,
-    height: usize,
-    scale_min: f64,
-    scale_max: f64,
-) -> Vec<Vec<(char, Color)>> {
-    if height == 0 {
-        return Vec::new();
-    }
-
-    if width == 0 {
-        return vec![Vec::new(); height];
-    }
-
-    let samples = history_viewport_samples_optional(values, width);
-
-    let steps: Vec<Option<i32>> = samples
-        .iter()
-        .map(|value| {
-            value.map(|value| value_to_vertical_steps(value, scale_min, scale_max, height))
-        })
-        .collect();
-
-    let mut rows = Vec::with_capacity(height);
-
-    for row_from_top in 0..height {
-        let row_from_bottom = height - 1 - row_from_top;
-        let row_base = (row_from_bottom * 4) as i32;
-        let row_color = row_position_color(row_from_top, height);
-
-        let mut line = Vec::with_capacity(width);
-        for col in 0..width {
-            let left_step = steps[col * 2];
-            let right_step = steps[col * 2 + 1];
-
-            if left_step.is_none() && right_step.is_none() {
-                line.push((' ', row_color));
-                continue;
-            }
-
-            let left_level = left_step.map(|step| (step - row_base).clamp(0, 4) as usize);
-            let right_level = right_step.map(|step| (step - row_base).clamp(0, 4) as usize);
-
-            line.push((
-                BRAILLE_5X5[left_level.unwrap_or(0) * 5 + right_level.unwrap_or(0)],
-                row_color,
-            ));
-        }
-
-        rows.push(line);
-    }
-
-    let bottom_row_color = row_position_color(height - 1, height);
-    for col in 0..width {
-        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
-        if has_visible_segment {
-            continue;
-        }
-
-        let left_active = samples[col * 2]
-            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
-            .unwrap_or(false);
-        let right_active = samples[col * 2 + 1]
-            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
-            .unwrap_or(false);
-        if !left_active && !right_active {
-            continue;
-        }
-
-        rows[height - 1][col] = (
-            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
-            bottom_row_color,
-        );
-    }
-
-    rows
-}
-
-fn braille_history_lines_optional_with_scale(
-    values: &[Option<f64>],
-    width: usize,
-    height: usize,
-    scale_min: f64,
-    scale_max: f64,
-) -> Vec<Line<'static>> {
-    braille_history_cells_optional_with_scale(values, width, height, scale_min, scale_max)
-        .into_iter()
-        .map(|row| {
-            let mut spans: Vec<Span> = Vec::new();
-            let mut run = String::new();
-            let mut run_color: Option<Color> = None;
-
-            for (ch, cell_color) in row {
-                let color = if ch == ' ' { None } else { Some(cell_color) };
-
-                if color != run_color && !run.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut run),
-                        graph_span_style(run_color),
-                    ));
-                }
-
-                run.push(ch);
-                run_color = color;
-            }
-
-            if !run.is_empty() {
-                spans.push(Span::styled(run, graph_span_style(run_color)));
-            }
-
-            Line::from(spans)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
-    let samples = history_viewport_samples(values, width);
-    let (scale_min, scale_max) = graph_scale_bounds(&samples);
-    braille_history_lines_with_scale(values, width, height, scale_min, scale_max)
-}
-
-#[cfg(test)]
-fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<String> {
-    braille_history_cells(values, width, height)
-        .into_iter()
-        .map(|row| row.into_iter().map(|(ch, _)| ch).collect())
-        .collect()
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
@@ -2307,36 +674,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         let graph_width = graph_inner.width as usize;
         let graph_height = graph_inner.height as usize;
 
-        let (graph_lines, graph_point_count, scale_min, scale_max) = match app
-            .main_graph_samples_for_width(graph_width, persistence::unix_time_secs_now())
-        {
-            MainGraphSamples::Live(graph_samples) => {
-                let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
-                let graph_lines = braille_history_lines_with_scale(
-                    &graph_samples,
-                    graph_width,
-                    graph_height,
-                    scale_min,
-                    scale_max,
-                );
-
-                (graph_lines, app.power_history.len(), scale_min, scale_max)
-            }
-            MainGraphSamples::Archive(graph_samples) => {
-                let (scale_min, scale_max) = graph_scale_bounds_optional(&graph_samples);
-                let graph_lines = braille_history_lines_optional_with_scale(
-                    &graph_samples,
-                    graph_width,
-                    graph_height,
-                    scale_min,
-                    scale_max,
-                );
-                let graph_point_count =
-                    graph_samples.iter().filter(|value| value.is_some()).count();
-
-                (graph_lines, graph_point_count, scale_min, scale_max)
-            }
-        };
+        let graph_samples = app.main_graph_live_samples_for_width(graph_width);
+        let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
+        let graph_lines = braille_history_lines_with_scale(
+            &graph_samples,
+            graph_width,
+            graph_height,
+            scale_min,
+            scale_max,
+        );
+        let graph_point_count = app.power_history.len();
 
         let graph_title_right = Line::from(vec![
             Span::styled("power ", Style::default().fg(COLOR_MUTED)),
@@ -2346,18 +693,15 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " • {} • {} pts • {:.1}–{:.1}",
-                    app.graph_range.label(),
-                    graph_point_count,
-                    scale_min,
-                    scale_max
+                    " • 8m • {} pts • {:.1}–{:.1}",
+                    graph_point_count, scale_min, scale_max
                 ),
                 Style::default().fg(COLOR_MUTED),
             ),
         ])
         .right_aligned();
 
-        let mut graph_bottom_spans = hotkey_hint_line("4 range • space pause").spans;
+        let mut graph_bottom_spans = hotkey_hint_line("space pause").spans;
         if let Some(error) = app.last_error.as_deref() {
             graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
             graph_bottom_spans.push(Span::styled(
@@ -2372,7 +716,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
         let graph_chips = vec![
             chip_line("¹etop", Some('¹')),
-            chip_line(&format!("4{}", app.graph_range.label()), Some('4')),
             {
                 let mut spans = chip_line(mode, None);
                 for span in &mut spans {
@@ -2685,11 +1028,24 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 "pinned offender".to_string()
             };
 
+            let archive_backed_mode = app.graph_range.archive_range().is_some();
+            let detail_range_label = if archive_backed_mode {
+                format!("hist {}", app.graph_range.label())
+            } else {
+                app.graph_range.label().to_string()
+            };
             let detail_block = panel_block()
-                .title_top(detail_title)
-                .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
+                .title_top(format!("{detail_title} • {detail_range_label}"))
+                .title_bottom(hotkey_hint_line("4 range • Enter unpin").right_aligned());
             let detail_inner = detail_block.inner(detail_rect);
             frame.render_widget(detail_block, detail_rect);
+            let offender_archive_samples = offender_pinned.as_ref().and_then(|name| {
+                if detail_inner.width == 0 {
+                    None
+                } else {
+                    app.offender_archive_samples_for_width(name, detail_inner.width as usize)
+                }
+            });
 
             let text_lines: Vec<Line> = match offender_pinned.as_ref() {
                 Some(name) => {
@@ -2709,12 +1065,74 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
                     let present_in_current = current > GRAPH_ACTIVITY_EPSILON;
 
-                    let mut lines = vec![
-                        Line::from(Span::styled(
-                            name.clone(),
-                            Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(vec![
+                    let mut lines = vec![Line::from(Span::styled(
+                        name.clone(),
+                        Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                    ))];
+
+                    if archive_backed_mode {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "live stats ",
+                                Style::default()
+                                    .fg(COLOR_MUTED)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("now ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{current:.1}"),
+                                Style::default()
+                                    .fg(spectrum_band_color(current, &app.settings.graph_heat))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("  avg2m ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  peak2m ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  live share ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{share:.1}%"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  live rank ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
+                        ]));
+
+                        match offender_archive_samples
+                            .as_deref()
+                            .and_then(archive_bucket_metrics)
+                        {
+                            Some(metrics) => lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!(
+                                        "hist {} grouped-name buckets ",
+                                        app.graph_range.label()
+                                    ),
+                                    Style::default().fg(COLOR_MUTED),
+                                ),
+                                Span::styled("avg bucket ", Style::default().fg(COLOR_MUTED)),
+                                Span::styled(
+                                    format!("{:.1}", metrics.avg_bucket_power),
+                                    Style::default().fg(COLOR_FG),
+                                ),
+                                Span::styled("  max bucket avg ", Style::default().fg(COLOR_MUTED)),
+                                Span::styled(
+                                    format!("{:.1}", metrics.max_bucket_power),
+                                    Style::default().fg(COLOR_FG),
+                                ),
+                                Span::styled("  buckets ", Style::default().fg(COLOR_MUTED)),
+                                Span::styled(
+                                    format!("{}", metrics.bucket_count),
+                                    Style::default().fg(COLOR_FG),
+                                ),
+                            ])),
+                            None => lines.push(Line::from(Span::styled(
+                                format!(
+                                    "hist {} grouped-name buckets: no historical data in selected range.",
+                                    app.graph_range.label()
+                                ),
+                                Style::default().fg(COLOR_MUTED),
+                            ))),
+                        }
+                    } else {
+                        lines.push(Line::from(vec![
                             Span::styled("now ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(
                                 format!("{current:.1}"),
@@ -2730,12 +1148,12 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                             Span::styled(format!("{share:.1}%"), Style::default().fg(COLOR_FG)),
                             Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                        ]),
-                    ];
+                        ]));
+                    }
 
                     if !present_in_current {
                         lines.push(Line::from(Span::styled(
-                            "Not present in the latest grouped sample.",
+                            "Not present in the latest live grouped sample.",
                             Style::default().fg(COLOR_MUTED),
                         )));
                     }
@@ -2769,19 +1187,33 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 let graph_w = graph_rect.width as usize;
                 let graph_h = graph_rect.height as usize;
                 if graph_w > 0 && graph_h > 0 {
-                    let history_samples =
-                        app.history_store
-                            .name_recent_values(name, HISTORY_LIMIT as u64, app.tick);
-                    let samples = history_viewport_samples(&history_samples, graph_w);
-                    let (mini_min, mini_max) = graph_scale_bounds(&samples);
-                    let mini_lines = braille_history_lines_with_scale(
-                        &history_samples,
-                        graph_w,
-                        graph_h,
-                        mini_min,
-                        mini_max,
-                    );
-                    frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                    if let Some(archive_samples) = offender_archive_samples.as_ref() {
+                        let (mini_min, mini_max) = graph_scale_bounds_optional(archive_samples);
+                        let mini_lines = braille_history_lines_optional_with_scale(
+                            archive_samples,
+                            graph_w,
+                            graph_h,
+                            mini_min,
+                            mini_max,
+                        );
+                        frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                    } else {
+                        let history_samples = app.history_store.name_recent_values(
+                            name,
+                            HISTORY_LIMIT as u64,
+                            app.tick,
+                        );
+                        let samples = history_viewport_samples(&history_samples, graph_w);
+                        let (mini_min, mini_max) = graph_scale_bounds(&samples);
+                        let mini_lines = braille_history_lines_with_scale(
+                            &history_samples,
+                            graph_w,
+                            graph_h,
+                            mini_min,
+                            mini_max,
+                        );
+                        frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                    }
                 }
             }
         }
@@ -3045,6 +1477,35 @@ fn draw_easter_egg(
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ArchiveBucketMetrics {
+    avg_bucket_power: f64,
+    max_bucket_power: f64,
+    bucket_count: usize,
+}
+
+fn archive_bucket_metrics(samples: &[Option<f64>]) -> Option<ArchiveBucketMetrics> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    let mut max = f64::NEG_INFINITY;
+
+    for value in samples.iter().flatten().copied() {
+        sum += value;
+        count += 1;
+        max = max.max(value);
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(ArchiveBucketMetrics {
+        avg_bucket_power: sum / count as f64,
+        max_bucket_power: max,
+        bucket_count: count,
+    })
+}
+
 fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
@@ -3136,155 +1597,6 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     frame.render_widget(content, inner);
 }
 
-fn snapshot_from_live_snapshot(live_snapshot: &persistence::LiveSnapshot) -> Snapshot {
-    let rows = live_snapshot
-        .samples
-        .iter()
-        .map(|sample| ProcRow {
-            pid: sample.pid,
-            process: sample.process.clone(),
-            process_lc: sample.process.to_lowercase(),
-            power: format!("{:.1}", sample.power),
-            power_num: sample.power,
-        })
-        .collect();
-
-    snapshot_from_rows(rows)
-}
-
-fn snapshot_from_rows(rows: Vec<ProcRow>) -> Snapshot {
-    let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
-    Snapshot { rows, total_power }
-}
-
-fn fetch_snapshot() -> io::Result<Snapshot> {
-    let child = Command::new(TOP_BIN)
-        .args(TOP_ARGS)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut excluded_pids = Vec::with_capacity(2);
-    if let Ok(top_pid) = i32::try_from(child.id()) {
-        excluded_pids.push(top_pid);
-    }
-    if let Ok(self_pid) = i32::try_from(std::process::id()) {
-        excluded_pids.push(self_pid);
-    }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "top command failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let rows = parse_second_sample_excluding(&stdout, &excluded_pids);
-    Ok(snapshot_from_rows(rows))
-}
-
-fn parse_second_sample_excluding(raw: &str, excluded_pids: &[i32]) -> Vec<ProcRow> {
-    // Keep macOS top "second sample" semantics by resetting rows each time we hit a PID header.
-    let mut rows = Vec::new();
-    let mut in_table = false;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with("PID") {
-            rows.clear();
-            in_table = true;
-            continue;
-        }
-
-        if !in_table {
-            continue;
-        }
-
-        let first = trimmed.chars().next().unwrap_or(' ');
-        if !first.is_ascii_digit() {
-            continue;
-        }
-
-        if let Some(row) = parse_row(trimmed) {
-            if excluded_pids.contains(&row.pid) {
-                continue;
-            }
-            rows.push(row);
-        }
-    }
-
-    rows
-}
-
-fn parse_row(line: &str) -> Option<ProcRow> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let pid = parts[0].parse::<i32>().ok()?;
-    let power_num = sanitize_power_value(parse_numeric_value(parts.last()?));
-    let power = format!("{power_num:.1}");
-    let process = parts[1..parts.len().saturating_sub(1)].join(" ");
-    let process_lc = process.to_lowercase();
-
-    Some(ProcRow {
-        pid,
-        process,
-        process_lc,
-        power_num,
-        power,
-    })
-}
-
-fn parse_numeric_value(s: &str) -> f64 {
-    let mut cleaned = String::new();
-    let mut seen_digit = false;
-    let mut seen_decimal = false;
-
-    for ch in s.trim().chars() {
-        if ch.is_ascii_digit() {
-            cleaned.push(ch);
-            seen_digit = true;
-            continue;
-        }
-
-        if ch == ',' {
-            if seen_digit {
-                continue;
-            }
-            break;
-        }
-
-        if ch == '.' && !seen_decimal {
-            cleaned.push(ch);
-            seen_decimal = true;
-            continue;
-        }
-
-        if seen_digit || seen_decimal {
-            break;
-        }
-    }
-
-    cleaned.parse::<f64>().unwrap_or(0.0)
-}
-
-fn sanitize_power_value(value: f64) -> f64 {
-    if value.is_finite() && (0.0..=MAX_REASONABLE_POWER).contains(&value) {
-        value
-    } else {
-        0.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3300,169 +1612,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_second_sample_keeps_only_last_pid_block() {
-        let raw = r#"
-Processes: 123 total
-PID COMMAND POWER
-1 launchd 0.2
-2 Finder 1.9
-
-PID COMMAND POWER
-99 Safari 12.3
-100 Google Chrome Helper 4.6
-"#;
-
-        let rows = parse_second_sample_excluding(raw, &[]);
-        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
-
-        assert_eq!(pids, vec![99, 100]);
-        assert_eq!(rows[1].process, "Google Chrome Helper");
+    fn archive_bucket_metrics_returns_none_when_no_historical_samples_exist() {
+        let samples = vec![None, None, None];
+        assert_eq!(archive_bucket_metrics(&samples), None);
     }
 
     #[test]
-    fn parse_second_sample_excludes_internal_pids() {
-        let raw = r#"
-PID COMMAND POWER
-10 etop 5.0
-20 top 3.0
-30 Safari 1.0
-"#;
+    fn archive_bucket_metrics_summarizes_visible_bucket_values() {
+        let samples = vec![None, Some(0.0), Some(2.0), Some(4.0), None];
+        let metrics = archive_bucket_metrics(&samples).expect("metrics should be present");
 
-        let rows = parse_second_sample_excluding(raw, &[10, 20]);
-        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
-
-        assert_eq!(pids, vec![30]);
-    }
-
-    #[test]
-    fn top_stream_parser_skips_warmup_frame() {
-        let mut parser = TopStreamParser::new(vec![]);
-        let mut snapshots = Vec::new();
-
-        let lines = [
-            "PID COMMAND POWER",
-            "10 Safari 1.0",
-            "",
-            "PID COMMAND POWER",
-            "20 Finder 2.5",
-            "",
-        ];
-
-        for line in lines {
-            if let Some(snapshot) = parser.push_line(line).expect("stream line should parse") {
-                snapshots.push(snapshot);
-            }
-        }
-
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].rows.len(), 1);
-        assert_eq!(snapshots[0].rows[0].pid, 20);
-        assert!((snapshots[0].total_power - 2.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn top_stream_parser_excludes_internal_pids() {
-        let mut parser = TopStreamParser::new(vec![30]);
-
-        parser
-            .push_line("PID COMMAND POWER")
-            .expect("header should parse");
-        parser
-            .push_line("10 warmup 0.1")
-            .expect("warmup row should parse");
-        parser.push_line("").expect("warmup end should parse");
-
-        parser
-            .push_line("PID COMMAND POWER")
-            .expect("header should parse");
-        parser
-            .push_line("30 top 7.0")
-            .expect("excluded row should parse");
-        let snapshot = parser
-            .push_line("31 Safari 1.0")
-            .expect("row should parse")
-            .or_else(|| parser.push_line("").expect("frame boundary should parse"))
-            .expect("second frame should emit");
-
-        let pids: Vec<i32> = snapshot.rows.iter().map(|row| row.pid).collect();
-        assert_eq!(pids, vec![31]);
-    }
-
-    #[test]
-    fn top_stream_parser_reports_row_parse_errors() {
-        let mut parser = TopStreamParser::new(vec![]);
-        parser
-            .push_line("PID COMMAND POWER")
-            .expect("header should parse");
-
-        let err = parser
-            .push_line("123")
-            .expect_err("malformed row should fail parsing");
-        assert!(err.contains("unable to parse top row"));
-    }
-
-    #[test]
-    fn parse_row_supports_multi_word_process_name() {
-        let row = parse_row("4242 Google Chrome Helper 9.1").expect("row should parse");
-
-        assert_eq!(row.pid, 4242);
-        assert_eq!(row.process, "Google Chrome Helper");
-        assert_eq!(row.power, "9.1");
-        assert!((row.power_num - 9.1).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn parse_row_rejects_missing_columns() {
-        assert!(parse_row("123 onlypid").is_none());
-    }
-
-    #[test]
-    fn parse_numeric_value_handles_grouping_separators_and_suffix_junk() {
-        assert_eq!(parse_numeric_value("1,234.5"), 1234.5);
-        assert_eq!(parse_numeric_value("12.3+"), 12.3);
-    }
-
-    #[test]
-    fn parse_row_sanitizes_implausibly_large_power_values() {
-        let row = parse_row("336 powerd 55443258.0").expect("row should parse");
-        assert_eq!(row.power_num, 0.0);
-        assert_eq!(row.power, "0.0");
-    }
-
-    #[test]
-    fn history_viewport_samples_keeps_latest_points_without_resampling() {
-        let samples = history_viewport_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 3);
-        assert_eq!(samples, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-    }
-
-    #[test]
-    fn history_viewport_samples_shifts_left_as_new_samples_arrive() {
-        let width = 3;
-        let before = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], width);
-        let after = history_viewport_samples(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], width);
-
-        assert_eq!(&after[..(width * 2) - 1], &before[1..]);
-        assert_eq!(after[(width * 2) - 1], 6.0);
-    }
-
-    #[test]
-    fn history_viewport_samples_left_pads_short_history_without_faking_plateaus() {
-        let samples = history_viewport_samples(&[7.0, 8.0], 4);
-        assert_eq!(samples, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]);
-    }
-
-    #[test]
-    fn history_viewport_samples_deque_matches_slice_behavior() {
-        let values = VecDeque::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let samples = history_viewport_samples_deque(&values, 3);
-        assert_eq!(samples, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-    }
-
-    #[test]
-    fn history_viewport_samples_deque_left_pads_short_history_without_faking_plateaus() {
-        let values = VecDeque::from(vec![7.0, 8.0]);
-        let samples = history_viewport_samples_deque(&values, 4);
-        assert_eq!(samples, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]);
+        assert_eq!(metrics.bucket_count, 3);
+        assert!((metrics.avg_bucket_power - 2.0).abs() < 1e-9);
+        assert_eq!(metrics.max_bucket_power, 4.0);
     }
 
     #[test]
@@ -3483,73 +1645,6 @@ PID COMMAND POWER
                 .all(|value| *value == 1.0 || *value == 9.0)
         );
         assert_eq!(app.power_history.back().copied(), Some(9.0));
-    }
-
-    #[test]
-    fn value_to_vertical_steps_keeps_low_nonzero_activity_visible() {
-        let steps = value_to_vertical_steps(0.1, 0.0, 200.0, 8);
-        assert_eq!(steps, 1);
-    }
-
-    #[test]
-    fn value_to_vertical_steps_keeps_near_zero_blank() {
-        let steps = value_to_vertical_steps(GRAPH_ACTIVITY_EPSILON * 0.5, 0.0, 200.0, 8);
-        assert_eq!(steps, 0);
-    }
-
-    #[test]
-    fn braille_history_rows_keeps_low_nonzero_activity_visible() {
-        let rows = braille_history_rows(&[0.1, 0.1, 0.1, 0.1], 2, 4);
-
-        let bottom = rows.last().expect("graph should have rows");
-        assert_ne!(bottom.chars().nth(0), Some(' '));
-        assert_ne!(bottom.chars().nth(1), Some(' '));
-
-        for row in rows.iter().take(rows.len().saturating_sub(1)) {
-            assert_eq!(row.chars().nth(0), Some(' '));
-            assert_eq!(row.chars().nth(1), Some(' '));
-        }
-    }
-
-    #[test]
-    fn braille_history_rows_uses_baseline_fallback_without_changing_geometry() {
-        let rows = braille_history_rows(&[0.1, 0.1], 1, 4);
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0], " ");
-        assert_eq!(rows[1], " ");
-        assert_eq!(rows[2], " ");
-        assert_ne!(rows[3], " ");
-    }
-
-    #[test]
-    fn braille_history_rows_treats_near_zero_as_blank() {
-        let low = GRAPH_ACTIVITY_EPSILON * 0.5;
-        let rows = braille_history_rows(&[low, low, low, low], 2, 4);
-
-        for row in &rows {
-            assert_eq!(row.chars().nth(0), Some(' '));
-            assert_eq!(row.chars().nth(1), Some(' '));
-        }
-    }
-
-    #[test]
-    fn braille_history_rows_single_row_uses_lookup_mapping() {
-        let rows = braille_history_rows(&[10.0], 1, 1);
-        assert_eq!(rows, vec!["⢰".to_string()]);
-    }
-
-    #[test]
-    fn braille_history_rows_respects_requested_dimensions() {
-        let rows = braille_history_rows(&[0.0, 5.0, 10.0], 6, 3);
-
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|row| row.chars().count() == 6));
-    }
-
-    #[test]
-    fn braille_history_rows_defaults_to_blanks_when_empty() {
-        let rows = braille_history_rows(&[], 4, 2);
-        assert_eq!(rows, vec!["    ".to_string(), "    ".to_string()]);
     }
 
     #[test]
@@ -3575,46 +1670,6 @@ PID COMMAND POWER
         assert_eq!(spectrum_band_color(25.0, &settings), COLOR_YELLOW);
         assert_eq!(spectrum_band_color(50.0, &settings), COLOR_ORANGE);
         assert_eq!(spectrum_band_color(70.0, &settings), COLOR_RED);
-    }
-
-    fn occupied_line_colors(line: &Line<'_>) -> Vec<Color> {
-        line.spans
-            .iter()
-            .filter(|span| span.content.chars().any(|ch| ch != ' '))
-            .filter_map(|span| span.style.fg)
-            .collect()
-    }
-
-    #[test]
-    fn row_position_color_bottom_row_is_green() {
-        assert_eq!(row_position_color(9, 10), COLOR_GREEN);
-        assert_eq!(row_position_color(0, 1), COLOR_GREEN);
-    }
-
-    #[test]
-    fn row_position_color_top_row_is_red() {
-        assert_eq!(row_position_color(0, 10), COLOR_RED);
-    }
-
-    #[test]
-    fn row_position_color_spans_full_spectrum_over_tall_graph() {
-        let colors: Vec<Color> = (0..10).map(|r| row_position_color(r, 10)).collect();
-        assert!(colors.contains(&COLOR_RED));
-        assert!(colors.contains(&COLOR_ORANGE));
-        assert!(colors.contains(&COLOR_YELLOW));
-        assert!(colors.contains(&COLOR_GREEN));
-    }
-
-    #[test]
-    fn graph_row_color_depends_only_on_position_not_column_value() {
-        let lines = braille_history_lines(&[80.0, 5.0, 80.0], 2, 8);
-
-        for line in &lines {
-            let colors = occupied_line_colors(line);
-            if let Some(first) = colors.first().copied() {
-                assert!(colors.iter().all(|color| *color == first));
-            }
-        }
     }
 
     fn key_press(ch: char) -> KeyEvent {
@@ -3687,22 +1742,54 @@ PID COMMAND POWER
     }
 
     #[test]
-    fn graph_range_8m_uses_existing_live_history_path() {
+    fn main_graph_stays_live_only_even_when_range_changes() {
         let mut app = App::new();
-        app.graph_range = GraphRange::Minutes8;
         app.power_history = VecDeque::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 
-        match app.main_graph_samples_for_width(2, 9_999) {
-            MainGraphSamples::Live(samples) => {
-                assert_eq!(
-                    samples,
-                    history_viewport_samples_deque(&app.power_history, 2)
-                );
-            }
-            MainGraphSamples::Archive(_) => {
-                panic!("8m graph range must stay on live history path");
-            }
+        for range in [
+            GraphRange::Minutes8,
+            GraphRange::Minutes30,
+            GraphRange::Hours3,
+            GraphRange::Hours12,
+        ] {
+            app.graph_range = range;
+            let samples = app.main_graph_live_samples_for_width(2);
+            assert_eq!(
+                samples,
+                history_viewport_samples_deque(&app.power_history, 2)
+            );
         }
+    }
+
+    #[test]
+    fn pinned_offender_history_uses_archive_grouped_data_for_ranges_above_8m() {
+        let mut app = App::new();
+        app.archive = persistence::ArchiveState {
+            raw_2s: VecDeque::from(vec![persistence::TierSample {
+                bucket_start_secs: 1_700,
+                sample_count: 2,
+                total_power_sum: 40.0,
+                groups: vec![persistence::GroupPowerSum {
+                    name: "Safari".to_string(),
+                    power_sum: 18.0,
+                }],
+            }]),
+            ..persistence::ArchiveState::default()
+        };
+
+        app.graph_range = GraphRange::Minutes8;
+        assert!(
+            app.offender_archive_samples_for_width("Safari", 3)
+                .is_none()
+        );
+
+        app.graph_range = GraphRange::Minutes30;
+        let samples = app
+            .offender_archive_samples_for_width("Safari", 3)
+            .expect("30m range should use grouped archive data");
+
+        assert_eq!(samples.len(), 6);
+        assert_eq!(samples[5], Some(9.0));
     }
 
     #[test]

@@ -27,31 +27,6 @@ pub const AGG_10S_CAPACITY: usize = 1_080; // 3h @ 10s
 pub const AGG_60S_BUCKET_SECS: u64 = 60;
 pub const AGG_60S_CAPACITY: usize = 720; // 12h @ 60s
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveGraphRange {
-    Minutes30,
-    Hours3,
-    Hours12,
-}
-
-impl ArchiveGraphRange {
-    fn window_secs(self) -> u64 {
-        match self {
-            Self::Minutes30 => 30 * 60,
-            Self::Hours3 => 3 * 60 * 60,
-            Self::Hours12 => 12 * 60 * 60,
-        }
-    }
-
-    fn bucket_secs(self) -> u64 {
-        match self {
-            Self::Minutes30 => RAW_2S_BUCKET_SECS,
-            Self::Hours3 => AGG_10S_BUCKET_SECS,
-            Self::Hours12 => AGG_60S_BUCKET_SECS,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveProcessSample {
     pub pid: i32,
@@ -149,100 +124,6 @@ impl ArchiveState {
         );
 
         self.last_sample_unix_secs = Some(timestamp_secs);
-    }
-
-    pub fn graph_samples_for_range(
-        &self,
-        range: ArchiveGraphRange,
-        viewport_width: usize,
-        now_secs: u64,
-    ) -> Vec<Option<f64>> {
-        let points = viewport_width.saturating_mul(2);
-        if points == 0 {
-            return Vec::new();
-        }
-
-        let window_secs = range.window_secs().max(1);
-        let window_end_exclusive = now_secs.saturating_add(1);
-        let window_start = window_end_exclusive.saturating_sub(window_secs);
-
-        #[derive(Default)]
-        struct GraphBin {
-            sum: f64,
-            count: u32,
-            force_gap: bool,
-        }
-
-        #[derive(Clone, Copy)]
-        struct PrevPoint {
-            bucket_start_secs: u64,
-            bin_idx: usize,
-        }
-
-        let mut bins: Vec<GraphBin> = std::iter::repeat_with(GraphBin::default)
-            .take(points)
-            .collect();
-
-        let mut prev: Option<PrevPoint> = None;
-        for tier_sample in self.tier_for_range(range) {
-            let bucket_start = tier_sample.bucket_start_secs;
-            if bucket_start < window_start || bucket_start >= window_end_exclusive {
-                continue;
-            }
-
-            let avg = if tier_sample.sample_count == 0 {
-                0.0
-            } else {
-                tier_sample.total_power_sum / f64::from(tier_sample.sample_count)
-            };
-
-            let mut target_idx = time_to_bin_idx(bucket_start, window_start, window_secs, points);
-
-            if let Some(prev_point) = prev {
-                target_idx = target_idx.max(prev_point.bin_idx);
-
-                let contiguous = bucket_start
-                    == prev_point
-                        .bucket_start_secs
-                        .saturating_add(range.bucket_secs());
-
-                if !contiguous {
-                    let gap_idx = target_idx.saturating_sub(1).min(points - 1);
-                    bins[gap_idx].force_gap = true;
-
-                    if target_idx == prev_point.bin_idx && target_idx + 1 < points {
-                        target_idx += 1;
-                    }
-                }
-            }
-
-            bins[target_idx].sum += avg;
-            bins[target_idx].count = bins[target_idx].count.saturating_add(1);
-            prev = Some(PrevPoint {
-                bucket_start_secs: bucket_start,
-                bin_idx: target_idx,
-            });
-        }
-
-        bins.into_iter()
-            .map(|bin| {
-                if bin.force_gap {
-                    None
-                } else if bin.count == 0 {
-                    None
-                } else {
-                    Some(bin.sum / f64::from(bin.count))
-                }
-            })
-            .collect()
-    }
-
-    fn tier_for_range(&self, range: ArchiveGraphRange) -> &VecDeque<TierSample> {
-        match range {
-            ArchiveGraphRange::Minutes30 => &self.raw_2s,
-            ArchiveGraphRange::Hours3 => &self.agg_10s,
-            ArchiveGraphRange::Hours12 => &self.agg_60s,
-        }
     }
 
     pub fn enforce_bounds(&mut self) {
@@ -536,24 +417,6 @@ fn upsert_aggregate_bucket(
         groups,
     ));
     trim_to_capacity(tier, capacity);
-}
-
-fn time_to_bin_idx(
-    timestamp_secs: u64,
-    window_start_secs: u64,
-    window_secs: u64,
-    bins: usize,
-) -> usize {
-    if bins == 0 || window_secs == 0 {
-        return 0;
-    }
-
-    let offset = timestamp_secs
-        .saturating_sub(window_start_secs)
-        .min(window_secs.saturating_sub(1));
-
-    let idx = ((u128::from(offset) * bins as u128) / u128::from(window_secs)) as usize;
-    idx.min(bins.saturating_sub(1))
 }
 
 fn trim_to_capacity<T>(deque: &mut VecDeque<T>, capacity: usize) {
@@ -927,61 +790,6 @@ mod tests {
         assert_eq!(archive.agg_60s[1].bucket_start_secs, 120);
         assert_eq!(archive.agg_60s[0].sample_count, 1);
         assert_eq!(archive.agg_60s[1].sample_count, 1);
-    }
-
-    #[test]
-    fn graph_samples_for_range_uses_averages_across_full_window() {
-        let archive = ArchiveState {
-            raw_2s: VecDeque::from(vec![
-                TierSample {
-                    bucket_start_secs: 10,
-                    sample_count: 2,
-                    total_power_sum: 20.0,
-                    groups: Vec::new(),
-                },
-                TierSample {
-                    bucket_start_secs: 1_700,
-                    sample_count: 1,
-                    total_power_sum: 30.0,
-                    groups: Vec::new(),
-                },
-            ]),
-            ..ArchiveState::default()
-        };
-
-        let samples = archive.graph_samples_for_range(ArchiveGraphRange::Minutes30, 3, 1_799);
-
-        assert_eq!(samples.len(), 6);
-        assert_eq!(samples[0], Some(10.0));
-        assert_eq!(samples[5], Some(30.0));
-        assert!(samples[1..5].iter().all(|value| value.is_none()));
-    }
-
-    #[test]
-    fn graph_samples_for_range_preserves_discontinuity_with_gap_bin() {
-        let archive = ArchiveState {
-            agg_10s: VecDeque::from(vec![
-                TierSample {
-                    bucket_start_secs: 100,
-                    sample_count: 1,
-                    total_power_sum: 10.0,
-                    groups: Vec::new(),
-                },
-                TierSample {
-                    bucket_start_secs: 100,
-                    sample_count: 1,
-                    total_power_sum: 12.0,
-                    groups: Vec::new(),
-                },
-            ]),
-            ..ArchiveState::default()
-        };
-
-        let samples = archive.graph_samples_for_range(ArchiveGraphRange::Hours3, 4, 10_799);
-
-        assert_eq!(samples.len(), 8);
-        assert_eq!(samples[0], None);
-        assert_eq!(samples[1], Some(12.0));
     }
 
     #[test]
