@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::{HashMap, VecDeque},
     io::{self, BufRead, BufReader},
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
@@ -7,7 +8,11 @@ use std::{
     time::Duration,
 };
 
+mod history;
+mod persistence;
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use history::{HistoryStore, NameOffenderMetrics, PidKey, ProcessSample};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
@@ -31,6 +36,10 @@ const COLLECTOR_POLL_EVERY: Duration = Duration::from_millis(200);
 const SAMPLER_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const SAMPLER_QUEUE_CAPACITY: usize = 8;
 const HISTORY_LIMIT: usize = 240;
+const HISTORY_STALE_TICKS: u64 = HISTORY_LIMIT as u64;
+const OFFENDER_AVG_WINDOW_TICKS: u64 = 60;
+const OFFENDER_PEAK_WINDOW_TICKS: u64 = 60;
+const PERSIST_FLUSH_EVERY_TICKS: u64 = 15;
 
 const COLOR_FG: Color = Color::Rgb(0xab, 0xb2, 0xbf);
 const COLOR_ACCENT: Color = Color::Rgb(0x61, 0xaf, 0xef);
@@ -41,6 +50,7 @@ const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const COLOR_ORANGE: Color = Color::Rgb(0xd1, 0x9a, 0x66);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 const GRAPH_ACTIVITY_EPSILON: f64 = 1e-3;
+const MAX_REASONABLE_POWER: f64 = 10_000.0;
 
 const BRAILLE_5X5: [char; 25] = [
     ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
@@ -65,12 +75,6 @@ struct Snapshot {
 struct PinnedProcess {
     pid: i32,
     process: String,
-}
-
-#[derive(Debug, Clone)]
-struct PinnedHistory {
-    pid: i32,
-    samples: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -320,6 +324,116 @@ impl SettingsModalState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableMode {
+    Processes,
+    Offenders,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffenderSort {
+    Current,
+    Avg2m,
+    Peak,
+    Share,
+}
+
+impl OffenderSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Current => Self::Avg2m,
+            Self::Avg2m => Self::Peak,
+            Self::Peak => Self::Share,
+            Self::Share => Self::Current,
+        }
+    }
+
+    fn title_label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Avg2m => "avg2m",
+            Self::Peak => "peak",
+            Self::Share => "share",
+        }
+    }
+
+    fn sort_by_label(self) -> &'static str {
+        match self {
+            Self::Current => "NOW↓",
+            Self::Avg2m => "AVG2M↓",
+            Self::Peak => "PEAK↓",
+            Self::Share => "SHARE↓",
+        }
+    }
+
+    fn header_label(self, column: Self, default: &'static str) -> &'static str {
+        if self == column {
+            self.sort_by_label()
+        } else {
+            default
+        }
+    }
+
+    fn compare(self, a: &NameOffenderMetrics, b: &NameOffenderMetrics) -> Ordering {
+        let primary = match self {
+            Self::Current => b.current.partial_cmp(&a.current),
+            Self::Avg2m => b.avg.partial_cmp(&a.avg),
+            Self::Peak => b.peak.partial_cmp(&a.peak),
+            Self::Share => b.share.partial_cmp(&a.share),
+        }
+        .unwrap_or(Ordering::Equal);
+
+        primary
+            .then_with(|| b.current.partial_cmp(&a.current).unwrap_or(Ordering::Equal))
+            .then_with(|| b.avg.partial_cmp(&a.avg).unwrap_or(Ordering::Equal))
+            .then_with(|| b.peak.partial_cmp(&a.peak).unwrap_or(Ordering::Equal))
+            .then_with(|| b.share.partial_cmp(&a.share).unwrap_or(Ordering::Equal))
+            .then_with(|| a.name.cmp(&b.name))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphRange {
+    Minutes8,
+    Minutes30,
+    Hours3,
+    Hours12,
+}
+
+impl GraphRange {
+    fn next(self) -> Self {
+        match self {
+            Self::Minutes8 => Self::Minutes30,
+            Self::Minutes30 => Self::Hours3,
+            Self::Hours3 => Self::Hours12,
+            Self::Hours12 => Self::Minutes8,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Minutes8 => "8m",
+            Self::Minutes30 => "30m",
+            Self::Hours3 => "3h",
+            Self::Hours12 => "12h",
+        }
+    }
+
+    fn archive_range(self) -> Option<persistence::ArchiveGraphRange> {
+        match self {
+            Self::Minutes8 => None,
+            Self::Minutes30 => Some(persistence::ArchiveGraphRange::Minutes30),
+            Self::Hours3 => Some(persistence::ArchiveGraphRange::Hours3),
+            Self::Hours12 => Some(persistence::ArchiveGraphRange::Hours12),
+        }
+    }
+}
+
+enum MainGraphSamples {
+    Live(Vec<f64>),
+    Archive(Vec<Option<f64>>),
+}
+
 struct App {
     snapshot: Snapshot,
     last_error: Option<String>,
@@ -328,17 +442,30 @@ struct App {
     settings: AppSettings,
     settings_modal: Option<SettingsModalState>,
     pinned: Option<PinnedProcess>,
-    pinned_history: Option<PinnedHistory>,
-    selected: usize,
-    scroll: usize,
-    filter_query: String,
-    filter_input: Option<String>,
-    power_history: Vec<f64>,
-    visible_indices: Vec<usize>,
-    visible_dirty: bool,
+    offender_pinned: Option<String>,
+    process_selected: usize,
+    process_scroll: usize,
+    process_filter_query: String,
+    process_filter_input: Option<String>,
+    offender_selected: usize,
+    offender_scroll: usize,
+    offender_filter_query: String,
+    offender_filter_input: Option<String>,
+    power_history: VecDeque<f64>,
+    live_snapshot_history: VecDeque<persistence::LiveSnapshot>,
+    archive: persistence::ArchiveState,
+    process_visible_indices: Vec<usize>,
+    process_visible_dirty: bool,
+    offender_rows: Vec<NameOffenderMetrics>,
+    offender_visible_indices: Vec<usize>,
+    offender_visible_dirty: bool,
+    offender_sort: OffenderSort,
+    graph_range: GraphRange,
     show_graph: bool,
     show_table: bool,
+    table_mode: TableMode,
     tick: u64,
+    history_store: HistoryStore,
 }
 
 impl App {
@@ -351,48 +478,80 @@ impl App {
             settings: AppSettings::default(),
             settings_modal: None,
             pinned: None,
-            pinned_history: None,
-            selected: 0,
-            scroll: 0,
-            filter_query: String::new(),
-            filter_input: None,
-            power_history: Vec::new(),
-            visible_indices: Vec::new(),
-            visible_dirty: true,
+            offender_pinned: None,
+            process_selected: 0,
+            process_scroll: 0,
+            process_filter_query: String::new(),
+            process_filter_input: None,
+            offender_selected: 0,
+            offender_scroll: 0,
+            offender_filter_query: String::new(),
+            offender_filter_input: None,
+            power_history: VecDeque::with_capacity(HISTORY_LIMIT),
+            live_snapshot_history: VecDeque::with_capacity(HISTORY_LIMIT),
+            archive: persistence::ArchiveState::default(),
+            process_visible_indices: Vec::new(),
+            process_visible_dirty: true,
+            offender_rows: Vec::new(),
+            offender_visible_indices: Vec::new(),
+            offender_visible_dirty: true,
+            offender_sort: OffenderSort::Current,
+            graph_range: GraphRange::Minutes8,
             show_graph: true,
             show_table: true,
+            table_mode: TableMode::Processes,
             tick: 0,
+            history_store: HistoryStore::new(HISTORY_LIMIT, HISTORY_STALE_TICKS),
         };
 
-        let visible_len = app.visible_len();
-        app.normalize_selection(visible_len);
+        let process_visible_len = app.process_visible_len();
+        app.normalize_process_selection(process_visible_len);
+        let offender_visible_len = app.offender_visible_len();
+        app.normalize_offender_selection(offender_visible_len);
         app
     }
 
-    fn active_filter(&self) -> &str {
-        self.filter_input
+    fn process_active_filter(&self) -> &str {
+        self.process_filter_input
             .as_deref()
-            .unwrap_or(self.filter_query.as_str())
+            .unwrap_or(self.process_filter_query.as_str())
     }
 
-    fn mark_visible_dirty(&mut self) {
-        self.visible_dirty = true;
+    fn offender_active_filter(&self) -> &str {
+        self.offender_filter_input
+            .as_deref()
+            .unwrap_or(self.offender_filter_query.as_str())
     }
 
-    fn rebuild_visible_if_needed(&mut self) {
-        if !self.visible_dirty {
+    fn is_filter_input_active(&self) -> bool {
+        match self.table_mode {
+            TableMode::Processes => self.process_filter_input.is_some(),
+            TableMode::Offenders => self.offender_filter_input.is_some(),
+        }
+    }
+
+    fn mark_process_visible_dirty(&mut self) {
+        self.process_visible_dirty = true;
+    }
+
+    fn mark_offender_visible_dirty(&mut self) {
+        self.offender_visible_dirty = true;
+    }
+
+    fn rebuild_process_visible_if_needed(&mut self) {
+        if !self.process_visible_dirty {
             return;
         }
 
-        let filter_lc = self.active_filter().trim().to_lowercase();
+        let filter_lc = self.process_active_filter().trim().to_lowercase();
         let has_filter = !filter_lc.is_empty();
 
-        self.visible_indices.clear();
-        self.visible_indices.reserve(
+        self.process_visible_indices.clear();
+        self.process_visible_indices.reserve(
             self.snapshot
                 .rows
                 .len()
-                .saturating_sub(self.visible_indices.len()),
+                .saturating_sub(self.process_visible_indices.len()),
         );
 
         for (idx, row) in self.snapshot.rows.iter().enumerate() {
@@ -403,11 +562,11 @@ impl App {
             };
 
             if matches {
-                self.visible_indices.push(idx);
+                self.process_visible_indices.push(idx);
             }
         }
 
-        self.visible_indices.sort_by(|a, b| {
+        self.process_visible_indices.sort_by(|a, b| {
             let ra = &self.snapshot.rows[*a];
             let rb = &self.snapshot.rows[*b];
 
@@ -417,54 +576,255 @@ impl App {
                 .then_with(|| ra.process.cmp(&rb.process))
         });
 
-        self.visible_dirty = false;
+        self.process_visible_dirty = false;
     }
 
-    fn visible_len(&mut self) -> usize {
-        self.rebuild_visible_if_needed();
-        self.visible_indices.len()
-    }
-
-    fn normalize_selection(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            self.selected = 0;
-            self.scroll = 0;
+    fn rebuild_offender_visible_if_needed(&mut self) {
+        if !self.offender_visible_dirty {
             return;
         }
 
-        if self.selected >= visible_len {
-            self.selected = visible_len - 1;
+        self.offender_rows = self
+            .history_store
+            .top_name_offenders(
+                self.tick,
+                OFFENDER_AVG_WINDOW_TICKS,
+                OFFENDER_PEAK_WINDOW_TICKS,
+                self.snapshot.total_power,
+                usize::MAX,
+            )
+            .into_iter()
+            .filter(|offender| {
+                offender.current > GRAPH_ACTIVITY_EPSILON
+                    || offender.avg > GRAPH_ACTIVITY_EPSILON
+                    || offender.peak > GRAPH_ACTIVITY_EPSILON
+            })
+            .collect();
+
+        self.offender_rows
+            .sort_by(|a, b| self.offender_sort.compare(a, b));
+
+        let filter_lc = self.offender_active_filter().trim().to_lowercase();
+        let has_filter = !filter_lc.is_empty();
+
+        self.offender_visible_indices.clear();
+        self.offender_visible_indices.reserve(
+            self.offender_rows
+                .len()
+                .saturating_sub(self.offender_visible_indices.len()),
+        );
+
+        for (idx, offender) in self.offender_rows.iter().enumerate() {
+            let matches = if !has_filter {
+                true
+            } else {
+                offender.name.to_lowercase().contains(&filter_lc)
+            };
+
+            if matches {
+                self.offender_visible_indices.push(idx);
+            }
         }
 
-        if self.scroll > self.selected {
-            self.scroll = self.selected;
+        self.offender_visible_dirty = false;
+    }
+
+    fn process_visible_len(&mut self) -> usize {
+        self.rebuild_process_visible_if_needed();
+        self.process_visible_indices.len()
+    }
+
+    fn offender_visible_len(&mut self) -> usize {
+        self.rebuild_offender_visible_if_needed();
+        self.offender_visible_indices.len()
+    }
+
+    fn visible_len(&mut self) -> usize {
+        match self.table_mode {
+            TableMode::Processes => self.process_visible_len(),
+            TableMode::Offenders => self.offender_visible_len(),
+        }
+    }
+
+    fn normalize_process_selection(&mut self, visible_len: usize) {
+        if visible_len == 0 {
+            self.process_selected = 0;
+            self.process_scroll = 0;
+            return;
+        }
+
+        if self.process_selected >= visible_len {
+            self.process_selected = visible_len - 1;
+        }
+
+        if self.process_scroll > self.process_selected {
+            self.process_scroll = self.process_selected;
+        }
+    }
+
+    fn normalize_offender_selection(&mut self, visible_len: usize) {
+        if visible_len == 0 {
+            self.offender_selected = 0;
+            self.offender_scroll = 0;
+            return;
+        }
+
+        if self.offender_selected >= visible_len {
+            self.offender_selected = visible_len - 1;
+        }
+
+        if self.offender_scroll > self.offender_selected {
+            self.offender_scroll = self.offender_selected;
+        }
+    }
+
+    fn normalize_selection(&mut self, visible_len: usize) {
+        match self.table_mode {
+            TableMode::Processes => self.normalize_process_selection(visible_len),
+            TableMode::Offenders => self.normalize_offender_selection(visible_len),
         }
     }
 
     fn record_history(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        self.power_history.push(self.snapshot.total_power);
+        self.power_history.push_back(self.snapshot.total_power);
 
-        if self.power_history.len() > HISTORY_LIMIT {
-            let extra = self.power_history.len() - HISTORY_LIMIT;
-            self.power_history.drain(0..extra);
+        while self.power_history.len() > HISTORY_LIMIT {
+            let _ = self.power_history.pop_front();
         }
 
-        if let Some(history) = self.pinned_history.as_mut() {
-            let pid = history.pid;
-            let current_power = self
-                .snapshot
-                .rows
-                .iter()
-                .find(|row| row.pid == pid)
-                .map(|row| row.power_num)
-                .unwrap_or(0.0);
-            history.samples.push(current_power);
+        let mut live_samples = Vec::with_capacity(self.snapshot.rows.len());
+        let mut grouped_totals: HashMap<String, f64> = HashMap::new();
 
-            if history.samples.len() > HISTORY_LIMIT {
-                let extra = history.samples.len() - HISTORY_LIMIT;
-                history.samples.drain(0..extra);
-            }
+        for row in &self.snapshot.rows {
+            live_samples.push(persistence::LiveProcessSample {
+                pid: row.pid,
+                process: row.process.clone(),
+                power: row.power_num,
+            });
+            *grouped_totals.entry(row.process.clone()).or_insert(0.0) += row.power_num;
+        }
+
+        self.history_store.update(
+            self.tick,
+            live_samples.iter().map(|sample| ProcessSample {
+                pid: sample.pid,
+                process: sample.process.as_str(),
+                power: sample.power,
+            }),
+        );
+
+        self.live_snapshot_history
+            .push_back(persistence::LiveSnapshot {
+                tick: self.tick,
+                samples: live_samples,
+            });
+        while self.live_snapshot_history.len() > HISTORY_LIMIT {
+            let _ = self.live_snapshot_history.pop_front();
+        }
+
+        self.archive.record_sample(
+            persistence::unix_time_secs_now(),
+            persistence::continuity_threshold_secs(REFRESH_EVERY),
+            self.snapshot.total_power,
+            grouped_totals.into_iter(),
+        );
+    }
+
+    fn rebuild_history_store_from_live_snapshots(&mut self) {
+        let mut store = HistoryStore::new(HISTORY_LIMIT, HISTORY_STALE_TICKS);
+
+        for snapshot in &self.live_snapshot_history {
+            store.update(
+                snapshot.tick,
+                snapshot.samples.iter().map(|sample| ProcessSample {
+                    pid: sample.pid,
+                    process: sample.process.as_str(),
+                    power: sample.power,
+                }),
+            );
+        }
+
+        self.history_store = store;
+    }
+
+    fn apply_loaded_session_cache(&mut self, loaded: persistence::LoadedSessionCache) {
+        let persistence::LoadedSessionCache {
+            mut cache,
+            gap_millis: _gap_millis,
+            hydrate_live,
+        } = loaded;
+
+        self.archive = cache.archive;
+
+        if !hydrate_live {
+            // Restore the archive foundation, but leave live buffers empty so the UI does
+            // not imply sampling continued across a real downtime gap.
+            return;
+        }
+
+        if cache.live_power_history.len() > HISTORY_LIMIT {
+            let drop = cache.live_power_history.len() - HISTORY_LIMIT;
+            cache.live_power_history.drain(0..drop);
+        }
+
+        cache.live_snapshots.sort_by_key(|snapshot| snapshot.tick);
+        if cache.live_snapshots.len() > HISTORY_LIMIT {
+            let drop = cache.live_snapshots.len() - HISTORY_LIMIT;
+            cache.live_snapshots.drain(0..drop);
+        }
+
+        self.power_history = VecDeque::from(cache.live_power_history);
+        self.live_snapshot_history = VecDeque::from(cache.live_snapshots);
+        self.tick = cache.last_tick;
+        if let Some(last_tick) = self
+            .live_snapshot_history
+            .back()
+            .map(|snapshot| snapshot.tick)
+        {
+            self.tick = self.tick.max(last_tick);
+        }
+
+        self.rebuild_history_store_from_live_snapshots();
+
+        if let Some(last_snapshot) = self.live_snapshot_history.back() {
+            self.snapshot = snapshot_from_live_snapshot(last_snapshot);
+            self.loading = false;
+            self.last_error = None;
+            self.mark_process_visible_dirty();
+            self.mark_offender_visible_dirty();
+            let process_visible_len = self.process_visible_len();
+            self.normalize_process_selection(process_visible_len);
+            let offender_visible_len = self.offender_visible_len();
+            self.normalize_offender_selection(offender_visible_len);
+        }
+    }
+
+    fn to_session_cache(&self) -> persistence::SessionCache {
+        persistence::SessionCache {
+            saved_at_unix_millis: persistence::unix_time_millis_now(),
+            last_tick: self.tick,
+            live_power_history: self.power_history.iter().copied().collect(),
+            live_snapshots: self.live_snapshot_history.iter().cloned().collect(),
+            archive: self.archive.clone(),
+        }
+    }
+
+    fn cycle_graph_range(&mut self) {
+        self.graph_range = self.graph_range.next();
+    }
+
+    fn main_graph_samples_for_width(&self, graph_width: usize, now_secs: u64) -> MainGraphSamples {
+        match self.graph_range.archive_range() {
+            None => MainGraphSamples::Live(history_viewport_samples_deque(
+                &self.power_history,
+                graph_width,
+            )),
+            Some(archive_range) => MainGraphSamples::Archive(self.archive.graph_samples_for_range(
+                archive_range,
+                graph_width,
+                now_secs,
+            )),
         }
     }
 
@@ -475,28 +835,64 @@ impl App {
     fn move_selection(&mut self, delta: isize) {
         let len = self.visible_len();
         if len == 0 {
-            self.selected = 0;
-            self.scroll = 0;
+            match self.table_mode {
+                TableMode::Processes => {
+                    self.process_selected = 0;
+                    self.process_scroll = 0;
+                }
+                TableMode::Offenders => {
+                    self.offender_selected = 0;
+                    self.offender_scroll = 0;
+                }
+            }
             return;
         }
 
+        let current = match self.table_mode {
+            TableMode::Processes => self.process_selected,
+            TableMode::Offenders => self.offender_selected,
+        };
         let max = (len - 1) as isize;
-        let next = (self.selected as isize + delta).clamp(0, max) as usize;
-        self.selected = next;
+        let next = (current as isize + delta).clamp(0, max) as usize;
+
+        match self.table_mode {
+            TableMode::Processes => self.process_selected = next,
+            TableMode::Offenders => self.offender_selected = next,
+        }
     }
 
     fn select_top(&mut self) {
-        self.selected = 0;
-        self.scroll = 0;
+        match self.table_mode {
+            TableMode::Processes => {
+                self.process_selected = 0;
+                self.process_scroll = 0;
+            }
+            TableMode::Offenders => {
+                self.offender_selected = 0;
+                self.offender_scroll = 0;
+            }
+        }
     }
 
     fn select_bottom(&mut self) {
         let len = self.visible_len();
-        if len == 0 {
-            self.selected = 0;
-            self.scroll = 0;
-        } else {
-            self.selected = len - 1;
+        match self.table_mode {
+            TableMode::Processes => {
+                if len == 0 {
+                    self.process_selected = 0;
+                    self.process_scroll = 0;
+                } else {
+                    self.process_selected = len - 1;
+                }
+            }
+            TableMode::Offenders => {
+                if len == 0 {
+                    self.offender_selected = 0;
+                    self.offender_scroll = 0;
+                } else {
+                    self.offender_selected = len - 1;
+                }
+            }
         }
     }
 
@@ -504,19 +900,75 @@ impl App {
         self.paused = !self.paused;
     }
 
+    fn is_process_table_mode(&self) -> bool {
+        self.table_mode == TableMode::Processes
+    }
+
+    fn toggle_table_mode(&mut self) {
+        self.table_mode = match self.table_mode {
+            TableMode::Processes => TableMode::Offenders,
+            TableMode::Offenders => TableMode::Processes,
+        };
+    }
+
+    fn selected_offender_name(&mut self) -> Option<String> {
+        self.rebuild_offender_visible_if_needed();
+        let idx = self
+            .offender_visible_indices
+            .get(self.offender_selected)
+            .copied()?;
+        self.offender_rows
+            .get(idx)
+            .map(|offender| offender.name.clone())
+    }
+
+    fn restore_offender_selection_by_name(&mut self, selected_name: Option<String>) {
+        self.rebuild_offender_visible_if_needed();
+
+        if let Some(name) = selected_name {
+            if let Some(next_selected) = self
+                .offender_visible_indices
+                .iter()
+                .position(|idx| self.offender_rows[*idx].name == name)
+            {
+                self.offender_selected = next_selected;
+            }
+        }
+
+        self.normalize_offender_selection(self.offender_visible_indices.len());
+    }
+
+    fn cycle_offender_sort(&mut self) {
+        let selected_name = self.selected_offender_name();
+        self.offender_sort = self.offender_sort.next();
+        self.mark_offender_visible_dirty();
+        self.restore_offender_selection_by_name(selected_name);
+    }
+
     fn is_pinned(&self) -> bool {
-        self.pinned.is_some()
+        self.is_process_table_mode() && self.pinned.is_some()
+    }
+
+    fn is_offender_pinned(&self) -> bool {
+        self.table_mode == TableMode::Offenders && self.offender_pinned.is_some()
     }
 
     fn toggle_pin(&mut self) {
-        if self.pinned.is_some() {
-            self.pinned = None;
-            self.pinned_history = None;
+        if !self.is_process_table_mode() {
             return;
         }
 
-        self.rebuild_visible_if_needed();
-        let Some(snapshot_idx) = self.visible_indices.get(self.selected).copied() else {
+        if self.pinned.is_some() {
+            self.pinned = None;
+            return;
+        }
+
+        self.rebuild_process_visible_if_needed();
+        let Some(snapshot_idx) = self
+            .process_visible_indices
+            .get(self.process_selected)
+            .copied()
+        else {
             return;
         };
 
@@ -525,11 +977,20 @@ impl App {
                 pid: row.pid,
                 process: row.process.clone(),
             });
-            self.pinned_history = Some(PinnedHistory {
-                pid: row.pid,
-                samples: vec![row.power_num],
-            });
         }
+    }
+
+    fn toggle_offender_pin(&mut self) {
+        if self.table_mode != TableMode::Offenders {
+            return;
+        }
+
+        if self.offender_pinned.is_some() {
+            self.offender_pinned = None;
+            return;
+        }
+
+        self.offender_pinned = self.selected_offender_name();
     }
 
     fn open_settings_modal(&mut self) {
@@ -621,63 +1082,122 @@ impl App {
     }
 
     fn start_filter_input(&mut self) {
-        self.filter_input = Some(self.filter_query.clone());
-        self.mark_visible_dirty();
+        match self.table_mode {
+            TableMode::Processes => {
+                self.process_filter_input = Some(self.process_filter_query.clone());
+                self.mark_process_visible_dirty();
+            }
+            TableMode::Offenders => {
+                self.offender_filter_input = Some(self.offender_filter_query.clone());
+                self.mark_offender_visible_dirty();
+            }
+        }
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
-        let Some(buf) = self.filter_input.as_mut() else {
-            return;
-        };
+        match self.table_mode {
+            TableMode::Processes => {
+                let Some(buf) = self.process_filter_input.as_mut() else {
+                    return;
+                };
 
-        let mut touched_filter = false;
+                let mut touched_filter = false;
 
-        match key.code {
-            KeyCode::Esc => {
-                self.filter_input = None;
-                self.selected = 0;
-                self.scroll = 0;
-                touched_filter = true;
+                match key.code {
+                    KeyCode::Esc => {
+                        self.process_filter_input = None;
+                        self.process_selected = 0;
+                        self.process_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Enter => {
+                        self.process_filter_query = buf.clone();
+                        self.process_filter_input = None;
+                        self.process_selected = 0;
+                        self.process_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                        self.process_selected = 0;
+                        self.process_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Char(ch) => {
+                        buf.push(ch);
+                        self.process_selected = 0;
+                        self.process_scroll = 0;
+                        touched_filter = true;
+                    }
+                    _ => {}
+                }
+
+                if touched_filter {
+                    self.mark_process_visible_dirty();
+                }
+
+                let visible_len = self.process_visible_len();
+                self.normalize_process_selection(visible_len);
             }
-            KeyCode::Enter => {
-                self.filter_query = buf.clone();
-                self.filter_input = None;
-                self.selected = 0;
-                self.scroll = 0;
-                touched_filter = true;
+            TableMode::Offenders => {
+                let Some(buf) = self.offender_filter_input.as_mut() else {
+                    return;
+                };
+
+                let mut touched_filter = false;
+
+                match key.code {
+                    KeyCode::Esc => {
+                        self.offender_filter_input = None;
+                        self.offender_selected = 0;
+                        self.offender_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Enter => {
+                        self.offender_filter_query = buf.clone();
+                        self.offender_filter_input = None;
+                        self.offender_selected = 0;
+                        self.offender_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                        self.offender_selected = 0;
+                        self.offender_scroll = 0;
+                        touched_filter = true;
+                    }
+                    KeyCode::Char(ch) => {
+                        buf.push(ch);
+                        self.offender_selected = 0;
+                        self.offender_scroll = 0;
+                        touched_filter = true;
+                    }
+                    _ => {}
+                }
+
+                if touched_filter {
+                    self.mark_offender_visible_dirty();
+                }
+
+                let visible_len = self.offender_visible_len();
+                self.normalize_offender_selection(visible_len);
             }
-            KeyCode::Backspace => {
-                buf.pop();
-                self.selected = 0;
-                self.scroll = 0;
-                touched_filter = true;
-            }
-            KeyCode::Char(ch) => {
-                buf.push(ch);
-                self.selected = 0;
-                self.scroll = 0;
-                touched_filter = true;
-            }
-            _ => {}
         }
-
-        if touched_filter {
-            self.mark_visible_dirty();
-        }
-
-        let visible_len = self.visible_len();
-        self.normalize_selection(visible_len);
     }
 
     fn apply_snapshot(&mut self, next: Snapshot) {
+        let selected_offender_name = self.selected_offender_name();
+
         self.snapshot = next;
         self.last_error = None;
         self.loading = false;
-        self.mark_visible_dirty();
+        self.mark_process_visible_dirty();
+        self.mark_offender_visible_dirty();
         self.record_history();
 
-        let visible_len = self.visible_len();
-        self.normalize_selection(visible_len);
+        let process_visible_len = self.process_visible_len();
+        self.normalize_process_selection(process_visible_len);
+        self.restore_offender_selection_by_name(selected_offender_name);
     }
 
     fn apply_refresh_error(&mut self, err: String) {
@@ -695,22 +1215,28 @@ impl App {
     fn status_hint_text(&self) -> &'static str {
         if self.settings_modal.is_some() {
             "Enter edit • Esc cancel"
-        } else if self.filter_input.is_some() {
+        } else if self.is_filter_input_active() {
             "Enter apply • Esc cancel"
+        } else if self.table_mode == TableMode::Offenders {
+            if self.offender_pinned.is_some() {
+                "Enter unpin • / filter • s sort • 3 processes • 4 range • space pause"
+            } else {
+                "j/k move • g/G jump • / filter • Enter pin • s sort • 3 processes • 4 range • space pause"
+            }
         } else if self.pinned.is_some() {
-            "Enter unpin • space pause"
+            "Enter unpin • / filter • 3 offenders • 4 range • space pause"
         } else {
-            "j/k move • Enter pin • space pause"
+            "j/k move • g/G jump • / filter • Enter pin • 3 offenders • 4 range • space pause"
         }
     }
 
     fn status_hint_chips(&self) -> Vec<(&'static str, char)> {
         if self.settings_modal.is_some() {
             vec![("menu", 'm')]
-        } else if self.filter_input.is_some() {
+        } else if self.is_filter_input_active() {
             vec![]
         } else {
-            vec![("menu", 'm'), ("filter", 'f'), ("quit", 'q')]
+            vec![("menu", 'm'), ("filter /", '/'), ("quit", 'q')]
         }
     }
 
@@ -724,23 +1250,36 @@ impl App {
             return false;
         }
 
-        if self.filter_input.is_some() {
+        if self.is_filter_input_active() {
             self.handle_filter_key(key);
             return false;
         }
 
+        let can_navigate = match self.table_mode {
+            TableMode::Processes => !self.is_pinned(),
+            TableMode::Offenders => !self.is_offender_pinned(),
+        };
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
-            KeyCode::Char('j') | KeyCode::Down if !self.is_pinned() => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up if !self.is_pinned() => self.move_selection(-1),
-            KeyCode::Char('g') if !self.is_pinned() => self.select_top(),
-            KeyCode::Char('G') if !self.is_pinned() => self.select_bottom(),
+            KeyCode::Char('j') | KeyCode::Down if can_navigate => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up if can_navigate => self.move_selection(-1),
+            KeyCode::Char('g') if can_navigate => self.select_top(),
+            KeyCode::Char('G') if can_navigate => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
             KeyCode::Char('1') => self.show_graph = !self.show_graph,
             KeyCode::Char('2') => self.show_table = !self.show_table,
-            KeyCode::Enter => self.toggle_pin(),
+            KeyCode::Char('3') => self.toggle_table_mode(),
+            KeyCode::Char('4') => self.cycle_graph_range(),
+            KeyCode::Char('s') | KeyCode::Char('S') if self.table_mode == TableMode::Offenders => {
+                self.cycle_offender_sort();
+            }
+            KeyCode::Enter => match self.table_mode {
+                TableMode::Processes => self.toggle_pin(),
+                TableMode::Offenders => self.toggle_offender_pin(),
+            },
             _ => {}
         }
 
@@ -786,6 +1325,17 @@ fn run_tui() -> io::Result<()> {
 
 fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
+
+    match persistence::load_session_cache_for_startup(REFRESH_EVERY, HISTORY_LIMIT) {
+        Ok(Some(loaded)) => app.apply_loaded_session_cache(loaded),
+        Ok(None) => {}
+        Err(err) => {
+            app.last_error = Some(format!("cache load failed: {err}"));
+        }
+    }
+
+    let mut last_persist_tick = app.tick;
+
     let (event_tx, event_rx) = mpsc::channel::<CollectorEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCommand>();
 
@@ -794,6 +1344,14 @@ fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let loop_result = (|| -> io::Result<()> {
         loop {
             drain_collector_events(&mut app, &event_rx);
+
+            if app.tick.wrapping_sub(last_persist_tick) >= PERSIST_FLUSH_EVERY_TICKS {
+                if let Err(err) = persistence::save_session_cache(&app.to_session_cache()) {
+                    app.last_error = Some(format!("cache flush failed: {err}"));
+                }
+                last_persist_tick = app.tick;
+            }
+
             terminal.draw(|f| draw_ui(f, &mut app))?;
 
             if event::poll(REDRAW_EVERY)? {
@@ -815,6 +1373,10 @@ fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
     let _ = cmd_tx.send(CollectorCommand::Stop);
     let _ = collector.join();
+
+    if let Err(err) = persistence::save_session_cache(&app.to_session_cache()) {
+        eprintln!("etop: failed to flush cache on shutdown: {err}");
+    }
 
     loop_result
 }
@@ -1278,6 +1840,86 @@ fn history_viewport_samples(values: &[f64], width: usize) -> Vec<f64> {
     samples
 }
 
+fn history_viewport_samples_deque(values: &VecDeque<f64>, width: usize) -> Vec<f64> {
+    let points = width.saturating_mul(2);
+    if points == 0 {
+        return Vec::new();
+    }
+
+    if values.is_empty() {
+        return vec![0.0; points];
+    }
+
+    let tail_len = values.len().min(points);
+    let mut samples = vec![0.0; points];
+    let start = points - tail_len;
+
+    for (dst, value) in samples[start..]
+        .iter_mut()
+        .zip(values.iter().skip(values.len() - tail_len))
+    {
+        *dst = *value;
+    }
+
+    samples
+}
+
+fn history_viewport_samples_optional(values: &[Option<f64>], width: usize) -> Vec<Option<f64>> {
+    let points = width.saturating_mul(2);
+    if points == 0 {
+        return Vec::new();
+    }
+
+    if values.is_empty() {
+        return vec![None; points];
+    }
+
+    if values.len() >= points {
+        return values[values.len() - points..].to_vec();
+    }
+
+    let mut samples = vec![None; points];
+    let start = points - values.len();
+    samples[start..].clone_from_slice(values);
+    samples
+}
+
+fn history_range_optional(values: &[Option<f64>]) -> Option<(f64, f64)> {
+    let mut iter = values.iter().flatten().copied();
+    let first = iter.next()?;
+
+    let mut min = first;
+    let mut max = first;
+
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+
+    Some((min, max))
+}
+
+fn graph_scale_bounds_optional(values: &[Option<f64>]) -> (f64, f64) {
+    let (raw_min, raw_max) = history_range_optional(values).unwrap_or((0.0, 0.0));
+
+    if raw_max <= 0.0 {
+        return (0.0, 1.0);
+    }
+
+    let span = (raw_max - raw_min).max(0.0);
+    let target_span = (raw_max * 0.25).max(1.0);
+
+    let base_max = if span < target_span {
+        raw_max + (target_span - span) * 0.5
+    } else {
+        raw_max
+    };
+
+    let adjusted_max = (base_max * 1.35).max(raw_max + 5.0);
+
+    (0.0, adjusted_max.max(1.0))
+}
+
 fn graph_scale_bounds(values: &[f64]) -> (f64, f64) {
     let (raw_min, raw_max) = history_range(values).unwrap_or((0.0, 0.0));
 
@@ -1367,7 +2009,6 @@ fn braille_history_cells_with_scale(
         .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
         .collect();
 
-
     let mut rows = Vec::with_capacity(height);
 
     for row_from_top in 0..height {
@@ -1451,6 +2092,122 @@ fn braille_history_lines_with_scale(
         .collect()
 }
 
+fn braille_history_cells_optional_with_scale(
+    values: &[Option<f64>],
+    width: usize,
+    height: usize,
+    scale_min: f64,
+    scale_max: f64,
+) -> Vec<Vec<(char, Color)>> {
+    if height == 0 {
+        return Vec::new();
+    }
+
+    if width == 0 {
+        return vec![Vec::new(); height];
+    }
+
+    let samples = history_viewport_samples_optional(values, width);
+
+    let steps: Vec<Option<i32>> = samples
+        .iter()
+        .map(|value| {
+            value.map(|value| value_to_vertical_steps(value, scale_min, scale_max, height))
+        })
+        .collect();
+
+    let mut rows = Vec::with_capacity(height);
+
+    for row_from_top in 0..height {
+        let row_from_bottom = height - 1 - row_from_top;
+        let row_base = (row_from_bottom * 4) as i32;
+        let row_color = row_position_color(row_from_top, height);
+
+        let mut line = Vec::with_capacity(width);
+        for col in 0..width {
+            let left_step = steps[col * 2];
+            let right_step = steps[col * 2 + 1];
+
+            if left_step.is_none() && right_step.is_none() {
+                line.push((' ', row_color));
+                continue;
+            }
+
+            let left_level = left_step.map(|step| (step - row_base).clamp(0, 4) as usize);
+            let right_level = right_step.map(|step| (step - row_base).clamp(0, 4) as usize);
+
+            line.push((
+                BRAILLE_5X5[left_level.unwrap_or(0) * 5 + right_level.unwrap_or(0)],
+                row_color,
+            ));
+        }
+
+        rows.push(line);
+    }
+
+    let bottom_row_color = row_position_color(height - 1, height);
+    for col in 0..width {
+        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
+        if has_visible_segment {
+            continue;
+        }
+
+        let left_active = samples[col * 2]
+            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
+            .unwrap_or(false);
+        let right_active = samples[col * 2 + 1]
+            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
+            .unwrap_or(false);
+        if !left_active && !right_active {
+            continue;
+        }
+
+        rows[height - 1][col] = (
+            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
+            bottom_row_color,
+        );
+    }
+
+    rows
+}
+
+fn braille_history_lines_optional_with_scale(
+    values: &[Option<f64>],
+    width: usize,
+    height: usize,
+    scale_min: f64,
+    scale_max: f64,
+) -> Vec<Line<'static>> {
+    braille_history_cells_optional_with_scale(values, width, height, scale_min, scale_max)
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            let mut run_color: Option<Color> = None;
+
+            for (ch, cell_color) in row {
+                let color = if ch == ' ' { None } else { Some(cell_color) };
+
+                if color != run_color && !run.is_empty() {
+                    spans.push(Span::styled(
+                        std::mem::take(&mut run),
+                        graph_span_style(run_color),
+                    ));
+                }
+
+                run.push(ch);
+                run_color = color;
+            }
+
+            if !run.is_empty() {
+                spans.push(Span::styled(run, graph_span_style(run_color)));
+            }
+
+            Line::from(spans)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn braille_history_lines(values: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
     let samples = history_viewport_samples(values, width);
@@ -1467,9 +2224,13 @@ fn braille_history_rows(values: &[f64], width: usize, height: usize) -> Vec<Stri
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
-    app.rebuild_visible_if_needed();
-    let visible_len = app.visible_indices.len();
-    app.normalize_selection(visible_len);
+    app.rebuild_process_visible_if_needed();
+    app.rebuild_offender_visible_if_needed();
+
+    let process_visible_len = app.process_visible_indices.len();
+    let offender_visible_len = app.offender_visible_indices.len();
+    app.normalize_process_selection(process_visible_len);
+    app.normalize_offender_selection(offender_visible_len);
 
     let pinned = app.pinned.clone();
     let pinned_row = pinned
@@ -1483,9 +2244,16 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .cloned();
 
     let pinned_rank = pinned.as_ref().and_then(|pin| {
-        app.visible_indices.iter().position(|idx| {
+        app.process_visible_indices.iter().position(|idx| {
             app.snapshot.rows[*idx].pid == pin.pid && app.snapshot.rows[*idx].process == pin.process
         })
+    });
+
+    let offender_pinned = app.offender_pinned.clone();
+    let offender_pinned_visible_rank = offender_pinned.as_ref().and_then(|name| {
+        app.offender_visible_indices
+            .iter()
+            .position(|idx| app.offender_rows[*idx].name == *name)
     });
 
     if !app.show_graph && !app.show_table {
@@ -1538,8 +2306,37 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         let graph_inner = panel_block().inner(graph_area);
         let graph_width = graph_inner.width as usize;
         let graph_height = graph_inner.height as usize;
-        let graph_samples = history_viewport_samples(&app.power_history, graph_width);
-        let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
+
+        let (graph_lines, graph_point_count, scale_min, scale_max) = match app
+            .main_graph_samples_for_width(graph_width, persistence::unix_time_secs_now())
+        {
+            MainGraphSamples::Live(graph_samples) => {
+                let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
+                let graph_lines = braille_history_lines_with_scale(
+                    &graph_samples,
+                    graph_width,
+                    graph_height,
+                    scale_min,
+                    scale_max,
+                );
+
+                (graph_lines, app.power_history.len(), scale_min, scale_max)
+            }
+            MainGraphSamples::Archive(graph_samples) => {
+                let (scale_min, scale_max) = graph_scale_bounds_optional(&graph_samples);
+                let graph_lines = braille_history_lines_optional_with_scale(
+                    &graph_samples,
+                    graph_width,
+                    graph_height,
+                    scale_min,
+                    scale_max,
+                );
+                let graph_point_count =
+                    graph_samples.iter().filter(|value| value.is_some()).count();
+
+                (graph_lines, graph_point_count, scale_min, scale_max)
+            }
+        };
 
         let graph_title_right = Line::from(vec![
             Span::styled("power ", Style::default().fg(COLOR_MUTED)),
@@ -1549,8 +2346,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " • {} pts • {:.1}–{:.1}",
-                    app.power_history.len(),
+                    " • {} • {} pts • {:.1}–{:.1}",
+                    app.graph_range.label(),
+                    graph_point_count,
                     scale_min,
                     scale_max
                 ),
@@ -1559,7 +2357,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         ])
         .right_aligned();
 
-        let mut graph_bottom_spans = hotkey_hint_line("space pause").spans;
+        let mut graph_bottom_spans = hotkey_hint_line("4 range • space pause").spans;
         if let Some(error) = app.last_error.as_deref() {
             graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
             graph_bottom_spans.push(Span::styled(
@@ -1574,6 +2372,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
         let graph_chips = vec![
             chip_line("¹etop", Some('¹')),
+            chip_line(&format!("4{}", app.graph_range.label()), Some('4')),
             {
                 let mut spans = chip_line(mode, None);
                 for span in &mut spans {
@@ -1609,14 +2408,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         );
 
         debug_assert!(graph_height > 0 || graph_width == 0);
-        let graph_lines = braille_history_lines_with_scale(
-            &app.power_history,
-            graph_width,
-            graph_height,
-            scale_min,
-            scale_max,
-        );
-
         let graph = Paragraph::new(graph_lines);
         frame.render_widget(graph, graph_inner);
     }
@@ -1627,7 +2418,15 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         }
         return;
     };
-    let (detail_area, rows_area) = if pinned.is_some() {
+    let show_process_table = app.table_mode == TableMode::Processes;
+
+    let show_detail = if show_process_table {
+        pinned.is_some()
+    } else {
+        offender_pinned.is_some()
+    };
+
+    let (detail_area, rows_area) = if show_detail {
         let min_rows: u16 = 6;
         let max_detail = table_region.height.saturating_sub(min_rows);
 
@@ -1645,235 +2444,485 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         (None, table_region)
     };
 
-    if let Some(detail_rect) = detail_area {
-        let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("pinned {}", pin.pid)
-        } else {
-            "pinned process".to_string()
-        };
+    if show_process_table {
+        if let Some(detail_rect) = detail_area {
+            let detail_title = if let Some(pin) = pinned.as_ref() {
+                format!("pinned {}", pin.pid)
+            } else {
+                "pinned process".to_string()
+            };
 
-        let detail_block = panel_block()
-            .title_top(detail_title)
-            .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
-        let detail_inner = detail_block.inner(detail_rect);
-        frame.render_widget(detail_block, detail_rect);
+            let detail_block = panel_block()
+                .title_top(detail_title)
+                .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
+            let detail_inner = detail_block.inner(detail_rect);
+            frame.render_widget(detail_block, detail_rect);
 
-        let text_lines: Vec<Line> = match (pinned.as_ref(), pinned_row.as_ref()) {
-            (Some(_), Some(row)) => {
-                let power_share = if app.snapshot.total_power > 0.0 {
-                    (row.power_num / app.snapshot.total_power) * 100.0
-                } else {
-                    0.0
-                };
+            let text_lines: Vec<Line> = match (pinned.as_ref(), pinned_row.as_ref()) {
+                (Some(_), Some(row)) => {
+                    let power_share = if app.snapshot.total_power > 0.0 {
+                        (row.power_num / app.snapshot.total_power) * 100.0
+                    } else {
+                        0.0
+                    };
 
-                let rank_text = pinned_rank
-                    .map(|rank| format!("#{} / {}", rank + 1, visible_len))
-                    .unwrap_or_else(|| "not in current filtered list".to_string());
+                    let rank_text = pinned_rank
+                        .map(|rank| format!("#{} / {}", rank + 1, process_visible_len))
+                        .unwrap_or_else(|| "not in current filtered list".to_string());
 
-                vec![
+                    vec![
+                        Line::from(Span::styled(
+                            row.process.clone(),
+                            Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(vec![
+                            Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
+                            Span::styled("  pwr ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                row.power.clone(),
+                                Style::default()
+                                    .fg(spectrum_band_color(
+                                        row.power_num,
+                                        &app.settings.graph_heat,
+                                    ))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{power_share:.1}%"),
+                                Style::default().fg(COLOR_FG),
+                            ),
+                            Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
+                        ]),
+                    ]
+                }
+                (Some(pin), None) => vec![
                     Line::from(Span::styled(
-                        row.process.clone(),
+                        format!("{} ({})", pin.process, pin.pid),
                         Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(vec![
-                        Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
-                        Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
-                        Span::styled("  pwr ", Style::default().fg(COLOR_MUTED)),
-                        Span::styled(
-                            row.power.clone(),
-                            Style::default()
-                                .fg(spectrum_band_color(row.power_num, &app.settings.graph_heat))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
-                        Span::styled(
-                            format!("{power_share:.1}%"),
-                            Style::default().fg(COLOR_FG),
-                        ),
-                        Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
-                        Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                    ]),
-                ]
-            }
-            (Some(pin), None) => vec![
-                Line::from(Span::styled(
-                    format!("{} ({})", pin.process, pin.pid),
-                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    "Not present in the latest top sample.",
-                    Style::default().fg(COLOR_MUTED),
-                )),
-            ],
-            _ => vec![],
-        };
+                    Line::from(Span::styled(
+                        "Not present in the latest top sample.",
+                        Style::default().fg(COLOR_MUTED),
+                    )),
+                ],
+                _ => vec![],
+            };
 
-        let text_height = text_lines.len() as u16;
-        let text_rect = Rect {
-            x: detail_inner.x,
-            y: detail_inner.y,
-            width: detail_inner.width,
-            height: text_height.min(detail_inner.height),
-        };
-        frame.render_widget(Paragraph::new(text_lines), text_rect);
-
-        let mini_graph_rect = if detail_inner.height > text_height {
-            Some(Rect {
+            let text_height = text_lines.len() as u16;
+            let text_rect = Rect {
                 x: detail_inner.x,
-                y: detail_inner.y + text_height,
+                y: detail_inner.y,
                 width: detail_inner.width,
-                height: detail_inner.height - text_height,
-            })
-        } else {
-            None
-        };
+                height: text_height.min(detail_inner.height),
+            };
+            frame.render_widget(Paragraph::new(text_lines), text_rect);
 
-        if let (Some(graph_rect), Some(history)) =
-            (mini_graph_rect, app.pinned_history.as_ref())
-        {
-            let graph_w = graph_rect.width as usize;
-            let graph_h = graph_rect.height as usize;
-            if graph_w > 0 && graph_h > 0 {
-                let samples = history_viewport_samples(&history.samples, graph_w);
-                let (mini_min, mini_max) = graph_scale_bounds(&samples);
-                let mini_lines = braille_history_lines_with_scale(
-                    &history.samples,
-                    graph_w,
-                    graph_h,
-                    mini_min,
-                    mini_max,
-                );
-                frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+            let mini_graph_rect = if detail_inner.height > text_height {
+                Some(Rect {
+                    x: detail_inner.x,
+                    y: detail_inner.y + text_height,
+                    width: detail_inner.width,
+                    height: detail_inner.height - text_height,
+                })
+            } else {
+                None
+            };
+
+            if let (Some(graph_rect), Some(pin)) = (mini_graph_rect, pinned.as_ref()) {
+                let graph_w = graph_rect.width as usize;
+                let graph_h = graph_rect.height as usize;
+                if graph_w > 0 && graph_h > 0 {
+                    let key = PidKey::new(pin.pid, pin.process.clone());
+                    let history_samples =
+                        app.history_store
+                            .pid_recent_values(&key, HISTORY_LIMIT as u64, app.tick);
+                    let samples = history_viewport_samples(&history_samples, graph_w);
+                    let (mini_min, mini_max) = graph_scale_bounds(&samples);
+                    let mini_lines = braille_history_lines_with_scale(
+                        &history_samples,
+                        graph_w,
+                        graph_h,
+                        mini_min,
+                        mini_max,
+                    );
+                    frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                }
             }
         }
-    }
 
-    let rows_visible = rows_area.height.saturating_sub(3) as usize;
+        let rows_visible = rows_area.height.saturating_sub(3) as usize;
 
-    if rows_visible > 0 && visible_len > 0 {
-        if app.selected < app.scroll {
-            app.scroll = app.selected;
+        if rows_visible > 0 && process_visible_len > 0 {
+            if app.process_selected < app.process_scroll {
+                app.process_scroll = app.process_selected;
+            }
+            if app.process_selected >= app.process_scroll + rows_visible {
+                app.process_scroll = app.process_selected + 1 - rows_visible;
+            }
+        } else {
+            app.process_scroll = 0;
         }
-        if app.selected >= app.scroll + rows_visible {
-            app.scroll = app.selected + 1 - rows_visible;
-        }
-    } else {
-        app.scroll = 0;
-    }
 
-    let start = app.scroll.min(visible_len);
-    let end = if rows_visible == 0 {
-        start
-    } else {
-        (start + rows_visible).min(visible_len)
-    };
+        let start = app.process_scroll.min(process_visible_len);
+        let end = if rows_visible == 0 {
+            start
+        } else {
+            (start + rows_visible).min(process_visible_len)
+        };
 
-    let graph_heat = app.settings.graph_heat.clone();
-    let rows = app.visible_indices[start..end].iter().map(|idx| {
-        let r = &app.snapshot.rows[*idx];
-        let is_pinned_row = pinned
+        let graph_heat = app.settings.graph_heat.clone();
+        let rows = app.process_visible_indices[start..end].iter().map(|idx| {
+            let r = &app.snapshot.rows[*idx];
+            let is_pinned_row = pinned
+                .as_ref()
+                .map(|pin| pin.pid == r.pid && pin.process == r.process)
+                .unwrap_or(false);
+
+            let row_style = if is_pinned_row {
+                Style::default()
+                    .bg(COLOR_SELECTED_BG)
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_FG)
+            };
+
+            Row::new([
+                Cell::from(r.pid.to_string()),
+                Cell::from(r.process.clone()),
+                Cell::from(r.power.clone())
+                    .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
+            ])
+            .style(row_style)
+        });
+
+        let header_row = Row::new([
+            Cell::from("PID"),
+            Cell::from("PROCESS"),
+            Cell::from("POWER"),
+        ])
+        .style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .bg(COLOR_SELECTED_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        let pin_suffix = pinned
             .as_ref()
-            .map(|pin| pin.pid == r.pid && pin.process == r.process)
-            .unwrap_or(false);
+            .map(|pin| format!(" • pinned pid {}", pin.pid))
+            .unwrap_or_default();
 
-        let row_style = if is_pinned_row {
+        let table_title_right = if app.process_filter_input.is_some() {
+            format!(
+                "{process_visible_len}/{} • filter edit: {}{}",
+                app.snapshot.rows.len(),
+                app.process_active_filter(),
+                pin_suffix,
+            )
+        } else if app.process_filter_query.is_empty() {
+            format!(
+                "{process_visible_len}/{} • power ↓{}",
+                app.snapshot.rows.len(),
+                pin_suffix,
+            )
+        } else {
+            format!(
+                "{process_visible_len}/{} • power ↓ • filter: {}{}",
+                app.snapshot.rows.len(),
+                app.process_filter_query,
+                pin_suffix,
+            )
+        };
+
+        let highlight_style = if app.is_pinned() {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
             Style::default()
                 .bg(COLOR_SELECTED_BG)
-                .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(COLOR_FG)
         };
 
-        Row::new([
-            Cell::from(r.pid.to_string()),
-            Cell::from(r.process.clone()),
-            Cell::from(r.power.clone())
-                .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
+        let table_block = panel_block()
+            .title_top(
+                Line::from(Span::styled(
+                    table_title_right,
+                    Style::default().fg(COLOR_MUTED),
+                ))
+                .right_aligned(),
+            )
+            .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(7),
+                Constraint::Percentage(70),
+                Constraint::Length(10),
+            ],
+        )
+        .header(header_row)
+        .block(table_block)
+        .column_spacing(1)
+        .style(Style::default().fg(COLOR_FG))
+        .row_highlight_style(highlight_style);
+
+        let selected_in_window = if process_visible_len == 0 || app.is_pinned() {
+            None
+        } else {
+            Some(app.process_selected.saturating_sub(start))
+        };
+        let mut table_state = TableState::default().with_selected(selected_in_window);
+        frame.render_stateful_widget(table, rows_area, &mut table_state);
+    } else {
+        if let Some(detail_rect) = detail_area {
+            let detail_title = if let Some(name) = offender_pinned.as_ref() {
+                format!("pinned {name}")
+            } else {
+                "pinned offender".to_string()
+            };
+
+            let detail_block = panel_block()
+                .title_top(detail_title)
+                .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
+            let detail_inner = detail_block.inner(detail_rect);
+            frame.render_widget(detail_block, detail_rect);
+
+            let text_lines: Vec<Line> = match offender_pinned.as_ref() {
+                Some(name) => {
+                    let current = app.history_store.name_current(name);
+                    let avg = app
+                        .history_store
+                        .name_avg(name, OFFENDER_AVG_WINDOW_TICKS, app.tick);
+                    let peak =
+                        app.history_store
+                            .name_peak(name, OFFENDER_PEAK_WINDOW_TICKS, app.tick);
+                    let share =
+                        app.history_store.name_share(name, app.snapshot.total_power) * 100.0;
+
+                    let rank_text = offender_pinned_visible_rank
+                        .map(|rank| format!("#{} / {}", rank + 1, offender_visible_len))
+                        .unwrap_or_else(|| "not in current filtered list".to_string());
+
+                    let present_in_current = current > GRAPH_ACTIVITY_EPSILON;
+
+                    let mut lines = vec![
+                        Line::from(Span::styled(
+                            name.clone(),
+                            Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(vec![
+                            Span::styled("now ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{current:.1}"),
+                                Style::default()
+                                    .fg(spectrum_band_color(current, &app.settings.graph_heat))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("  avg2m ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  peak ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(format!("{share:.1}%"), Style::default().fg(COLOR_FG)),
+                            Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
+                        ]),
+                    ];
+
+                    if !present_in_current {
+                        lines.push(Line::from(Span::styled(
+                            "Not present in the latest grouped sample.",
+                            Style::default().fg(COLOR_MUTED),
+                        )));
+                    }
+
+                    lines
+                }
+                None => vec![],
+            };
+
+            let text_height = text_lines.len() as u16;
+            let text_rect = Rect {
+                x: detail_inner.x,
+                y: detail_inner.y,
+                width: detail_inner.width,
+                height: text_height.min(detail_inner.height),
+            };
+            frame.render_widget(Paragraph::new(text_lines), text_rect);
+
+            let mini_graph_rect = if detail_inner.height > text_height {
+                Some(Rect {
+                    x: detail_inner.x,
+                    y: detail_inner.y + text_height,
+                    width: detail_inner.width,
+                    height: detail_inner.height - text_height,
+                })
+            } else {
+                None
+            };
+
+            if let (Some(graph_rect), Some(name)) = (mini_graph_rect, offender_pinned.as_ref()) {
+                let graph_w = graph_rect.width as usize;
+                let graph_h = graph_rect.height as usize;
+                if graph_w > 0 && graph_h > 0 {
+                    let history_samples =
+                        app.history_store
+                            .name_recent_values(name, HISTORY_LIMIT as u64, app.tick);
+                    let samples = history_viewport_samples(&history_samples, graph_w);
+                    let (mini_min, mini_max) = graph_scale_bounds(&samples);
+                    let mini_lines = braille_history_lines_with_scale(
+                        &history_samples,
+                        graph_w,
+                        graph_h,
+                        mini_min,
+                        mini_max,
+                    );
+                    frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                }
+            }
+        }
+
+        let rows_visible = rows_area.height.saturating_sub(3) as usize;
+        let offender_total = app.offender_rows.len();
+
+        if rows_visible > 0 && offender_visible_len > 0 {
+            if app.offender_selected < app.offender_scroll {
+                app.offender_scroll = app.offender_selected;
+            }
+            if app.offender_selected >= app.offender_scroll + rows_visible {
+                app.offender_scroll = app.offender_selected + 1 - rows_visible;
+            }
+        } else {
+            app.offender_scroll = 0;
+        }
+
+        let start = app.offender_scroll.min(offender_visible_len);
+        let end = if rows_visible == 0 {
+            start
+        } else {
+            (start + rows_visible).min(offender_visible_len)
+        };
+
+        let rows = app.offender_visible_indices[start..end].iter().map(|idx| {
+            let offender = &app.offender_rows[*idx];
+            let is_pinned_row = offender_pinned
+                .as_ref()
+                .map(|name| name == &offender.name)
+                .unwrap_or(false);
+
+            let row_style = if is_pinned_row {
+                Style::default()
+                    .bg(COLOR_SELECTED_BG)
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_FG)
+            };
+
+            Row::new([
+                Cell::from(offender.name.clone()),
+                Cell::from(format!("{:.1}", offender.current)).style(Style::default().fg(
+                    spectrum_band_color(offender.current, &app.settings.graph_heat),
+                )),
+                Cell::from(format!("{:.1}", offender.avg)),
+                Cell::from(format!("{:.1}", offender.peak)),
+                Cell::from(format!("{:>5.1}%", offender.share * 100.0)),
+            ])
+            .style(row_style)
+        });
+
+        let header_row = Row::new([
+            Cell::from("PROCESS"),
+            Cell::from(app.offender_sort.header_label(OffenderSort::Current, "NOW")),
+            Cell::from(app.offender_sort.header_label(OffenderSort::Avg2m, "AVG2M")),
+            Cell::from(app.offender_sort.header_label(OffenderSort::Peak, "PEAK")),
+            Cell::from(app.offender_sort.header_label(OffenderSort::Share, "SHARE")),
         ])
-        .style(row_style)
-    });
+        .style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .bg(COLOR_SELECTED_BG)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    let header_row = Row::new([
-        Cell::from("PID"),
-        Cell::from("PROCESS"),
-        Cell::from("POWER"),
-    ])
-    .style(
-        Style::default()
-            .fg(COLOR_ACCENT)
-            .bg(COLOR_SELECTED_BG)
-            .add_modifier(Modifier::BOLD),
-    );
+        let pin_suffix = offender_pinned
+            .as_ref()
+            .map(|name| format!(" • pinned {name}"))
+            .unwrap_or_default();
 
-    let pin_suffix = pinned
-        .as_ref()
-        .map(|pin| format!(" • pinned pid {}", pin.pid))
-        .unwrap_or_default();
+        let table_title_right = if app.offender_filter_input.is_some() {
+            format!(
+                "{offender_visible_len}/{offender_total} groups • filter edit: {} • sort: {}{}",
+                app.offender_active_filter(),
+                app.offender_sort.title_label(),
+                pin_suffix,
+            )
+        } else if app.offender_filter_query.is_empty() {
+            format!(
+                "{offender_visible_len}/{offender_total} groups • offender view • sort: {}{}",
+                app.offender_sort.title_label(),
+                pin_suffix,
+            )
+        } else {
+            format!(
+                "{offender_visible_len}/{offender_total} groups • filter: {} • sort: {}{}",
+                app.offender_filter_query,
+                app.offender_sort.title_label(),
+                pin_suffix,
+            )
+        };
 
-    let table_title_right = if app.filter_input.is_some() {
-        format!(
-            "{visible_len}/{} • filter edit: {}{}",
-            app.snapshot.rows.len(),
-            app.active_filter(),
-            pin_suffix,
+        let highlight_style = if app.is_offender_pinned() {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+                .bg(COLOR_SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let table_block = panel_block()
+            .title_top(
+                Line::from(Span::styled(
+                    table_title_right,
+                    Style::default().fg(COLOR_MUTED),
+                ))
+                .right_aligned(),
+            )
+            .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(52),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+            ],
         )
-    } else if app.filter_query.is_empty() {
-        format!(
-            "{visible_len}/{} • power ↓{}",
-            app.snapshot.rows.len(),
-            pin_suffix,
-        )
-    } else {
-        format!(
-            "{visible_len}/{} • power ↓ • filter: {}{}",
-            app.snapshot.rows.len(),
-            app.filter_query,
-            pin_suffix,
-        )
-    };
+        .header(header_row)
+        .block(table_block)
+        .column_spacing(1)
+        .style(Style::default().fg(COLOR_FG))
+        .row_highlight_style(highlight_style);
 
-    let highlight_style = if app.is_pinned() {
-        Style::default().add_modifier(Modifier::DIM)
-    } else {
-        Style::default()
-            .bg(COLOR_SELECTED_BG)
-            .add_modifier(Modifier::BOLD)
-    };
+        let selected_in_window = if offender_visible_len == 0 || app.is_offender_pinned() {
+            None
+        } else {
+            Some(app.offender_selected.saturating_sub(start))
+        };
+        let mut table_state = TableState::default().with_selected(selected_in_window);
+        frame.render_stateful_widget(table, rows_area, &mut table_state);
+    }
 
-    let table_block = panel_block()
-        .title_top(
-            Line::from(Span::styled(
-                table_title_right,
-                Style::default().fg(COLOR_MUTED),
-            ))
-            .right_aligned(),
-        )
-        .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(7),
-            Constraint::Percentage(70),
-            Constraint::Length(10),
-        ],
-    )
-    .header(header_row)
-    .block(table_block)
-    .column_spacing(1)
-    .style(Style::default().fg(COLOR_FG))
-    .row_highlight_style(highlight_style);
-
-    let selected_in_window = if visible_len == 0 || app.is_pinned() {
-        None
-    } else {
-        Some(app.selected.saturating_sub(start))
-    };
-    let mut table_state = TableState::default().with_selected(selected_in_window);
-    frame.render_stateful_widget(table, rows_area, &mut table_state);
-
-    let table_chips = vec![chip_line("²processes", Some('²'))];
+    let table_chips = vec![
+        chip_line("²processes", Some('²')),
+        chip_line("³offenders", Some('³')),
+    ];
     draw_chips_on_border(
         frame.buffer_mut(),
         rows_area,
@@ -1923,11 +2972,11 @@ fn draw_easter_egg(
     frame: &mut Frame,
     area: Rect,
     tick: u64,
-    power_history: &[f64],
+    power_history: &VecDeque<f64>,
     current_power: f64,
 ) {
-    let block = panel_block()
-        .title_bottom(hotkey_hint_line("1 graph • 2 table • q quit").right_aligned());
+    let block =
+        panel_block().title_bottom(hotkey_hint_line("1 graph • 2 table • q quit").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1968,10 +3017,10 @@ fn draw_easter_egg(
         width: spark_width,
         height: spark_height,
     };
-    let samples = history_viewport_samples(power_history, spark_width as usize);
+    let samples = history_viewport_samples_deque(power_history, spark_width as usize);
     let (scale_min, scale_max) = graph_scale_bounds(&samples);
     let spark_lines = braille_history_lines_with_scale(
-        power_history,
+        &samples,
         spark_width as usize,
         spark_height as usize,
         scale_min,
@@ -2087,6 +3136,22 @@ fn draw_settings_modal(frame: &mut Frame, modal: &SettingsModalState) {
     frame.render_widget(content, inner);
 }
 
+fn snapshot_from_live_snapshot(live_snapshot: &persistence::LiveSnapshot) -> Snapshot {
+    let rows = live_snapshot
+        .samples
+        .iter()
+        .map(|sample| ProcRow {
+            pid: sample.pid,
+            process: sample.process.clone(),
+            process_lc: sample.process.to_lowercase(),
+            power: format!("{:.1}", sample.power),
+            power_num: sample.power,
+        })
+        .collect();
+
+    snapshot_from_rows(rows)
+}
+
 fn snapshot_from_rows(rows: Vec<ProcRow>) -> Snapshot {
     let total_power = rows.iter().map(|r| r.power_num).sum::<f64>();
     Snapshot { rows, total_power }
@@ -2165,7 +3230,8 @@ fn parse_row(line: &str) -> Option<ProcRow> {
     }
 
     let pid = parts[0].parse::<i32>().ok()?;
-    let power = parts.last()?.to_string();
+    let power_num = sanitize_power_value(parse_numeric_value(parts.last()?));
+    let power = format!("{power_num:.1}");
     let process = parts[1..parts.len().saturating_sub(1)].join(" ");
     let process_lc = process.to_lowercase();
 
@@ -2173,22 +3239,65 @@ fn parse_row(line: &str) -> Option<ProcRow> {
         pid,
         process,
         process_lc,
-        power_num: parse_numeric_value(&power),
+        power_num,
         power,
     })
 }
 
 fn parse_numeric_value(s: &str) -> f64 {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
+    let mut cleaned = String::new();
+    let mut seen_digit = false;
+    let mut seen_decimal = false;
+
+    for ch in s.trim().chars() {
+        if ch.is_ascii_digit() {
+            cleaned.push(ch);
+            seen_digit = true;
+            continue;
+        }
+
+        if ch == ',' {
+            if seen_digit {
+                continue;
+            }
+            break;
+        }
+
+        if ch == '.' && !seen_decimal {
+            cleaned.push(ch);
+            seen_decimal = true;
+            continue;
+        }
+
+        if seen_digit || seen_decimal {
+            break;
+        }
+    }
+
     cleaned.parse::<f64>().unwrap_or(0.0)
+}
+
+fn sanitize_power_value(value: f64) -> f64 {
+    if value.is_finite() && (0.0..=MAX_REASONABLE_POWER).contains(&value) {
+        value
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(pid: i32, process: &str, power_num: f64) -> ProcRow {
+        ProcRow {
+            pid,
+            process: process.to_string(),
+            process_lc: process.to_lowercase(),
+            power: format!("{power_num:.1}"),
+            power_num,
+        }
+    }
 
     #[test]
     fn parse_second_sample_keeps_only_last_pid_block() {
@@ -2308,6 +3417,19 @@ PID COMMAND POWER
     }
 
     #[test]
+    fn parse_numeric_value_handles_grouping_separators_and_suffix_junk() {
+        assert_eq!(parse_numeric_value("1,234.5"), 1234.5);
+        assert_eq!(parse_numeric_value("12.3+"), 12.3);
+    }
+
+    #[test]
+    fn parse_row_sanitizes_implausibly_large_power_values() {
+        let row = parse_row("336 powerd 55443258.0").expect("row should parse");
+        assert_eq!(row.power_num, 0.0);
+        assert_eq!(row.power, "0.0");
+    }
+
+    #[test]
     fn history_viewport_samples_keeps_latest_points_without_resampling() {
         let samples = history_viewport_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 3);
         assert_eq!(samples, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
@@ -2327,6 +3449,40 @@ PID COMMAND POWER
     fn history_viewport_samples_left_pads_short_history_without_faking_plateaus() {
         let samples = history_viewport_samples(&[7.0, 8.0], 4);
         assert_eq!(samples, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn history_viewport_samples_deque_matches_slice_behavior() {
+        let values = VecDeque::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let samples = history_viewport_samples_deque(&values, 3);
+        assert_eq!(samples, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn history_viewport_samples_deque_left_pads_short_history_without_faking_plateaus() {
+        let values = VecDeque::from(vec![7.0, 8.0]);
+        let samples = history_viewport_samples_deque(&values, 4);
+        assert_eq!(samples, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn record_history_trims_oversized_deque_back_to_limit() {
+        let mut app = App::new();
+        app.power_history = VecDeque::from(vec![1.0; HISTORY_LIMIT + 3]);
+        app.snapshot = Snapshot {
+            rows: Vec::new(),
+            total_power: 9.0,
+        };
+
+        app.record_history();
+
+        assert_eq!(app.power_history.len(), HISTORY_LIMIT);
+        assert!(
+            app.power_history
+                .iter()
+                .all(|value| *value == 1.0 || *value == 9.0)
+        );
+        assert_eq!(app.power_history.back().copied(), Some(9.0));
     }
 
     #[test]
@@ -2461,6 +3617,305 @@ PID COMMAND POWER
         }
     }
 
+    fn key_press(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn key_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn seed_offender_sort_history(app: &mut App) {
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 60.0),
+            row(20, "Mail", 20.0),
+            row(30, "Slack", 5.0),
+        ]));
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 1.0),
+            row(20, "Mail", 20.0),
+            row(30, "Slack", 6.0),
+        ]));
+        app.table_mode = TableMode::Offenders;
+    }
+
+    fn offender_names_in_visible_order(app: &mut App) -> Vec<String> {
+        app.rebuild_offender_visible_if_needed();
+        app.offender_visible_indices
+            .iter()
+            .map(|idx| app.offender_rows[*idx].name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn offender_sort_cycles_with_s_key_and_wraps() {
+        let mut app = App::new();
+        app.table_mode = TableMode::Offenders;
+
+        assert_eq!(app.offender_sort, OffenderSort::Current);
+
+        app.handle_key(key_press('s'));
+        assert_eq!(app.offender_sort, OffenderSort::Avg2m);
+
+        app.handle_key(key_press('s'));
+        assert_eq!(app.offender_sort, OffenderSort::Peak);
+
+        app.handle_key(key_press('s'));
+        assert_eq!(app.offender_sort, OffenderSort::Share);
+
+        app.handle_key(key_press('s'));
+        assert_eq!(app.offender_sort, OffenderSort::Current);
+    }
+
+    #[test]
+    fn graph_range_cycles_with_4_key_and_wraps() {
+        let mut app = App::new();
+
+        assert_eq!(app.graph_range, GraphRange::Minutes8);
+
+        app.handle_key(key_press('4'));
+        assert_eq!(app.graph_range, GraphRange::Minutes30);
+
+        app.handle_key(key_press('4'));
+        assert_eq!(app.graph_range, GraphRange::Hours3);
+
+        app.handle_key(key_press('4'));
+        assert_eq!(app.graph_range, GraphRange::Hours12);
+
+        app.handle_key(key_press('4'));
+        assert_eq!(app.graph_range, GraphRange::Minutes8);
+    }
+
+    #[test]
+    fn graph_range_8m_uses_existing_live_history_path() {
+        let mut app = App::new();
+        app.graph_range = GraphRange::Minutes8;
+        app.power_history = VecDeque::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        match app.main_graph_samples_for_width(2, 9_999) {
+            MainGraphSamples::Live(samples) => {
+                assert_eq!(
+                    samples,
+                    history_viewport_samples_deque(&app.power_history, 2)
+                );
+            }
+            MainGraphSamples::Archive(_) => {
+                panic!("8m graph range must stay on live history path");
+            }
+        }
+    }
+
+    #[test]
+    fn process_mode_ignores_s_sort_key() {
+        let mut app = App::new();
+        app.table_mode = TableMode::Processes;
+        app.offender_sort = OffenderSort::Peak;
+
+        app.handle_key(key_press('s'));
+
+        assert_eq!(app.offender_sort, OffenderSort::Peak);
+    }
+
+    #[test]
+    fn enter_toggles_process_pin_in_process_mode() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(20, "Mail", 4.0),
+        ]));
+        app.table_mode = TableMode::Processes;
+
+        app.handle_key(key_enter());
+        let pinned = app.pinned.as_ref().expect("process should be pinned");
+        assert_eq!(pinned.pid, 10);
+        assert_eq!(pinned.process, "Safari");
+
+        app.handle_key(key_enter());
+        assert!(app.pinned.is_none());
+    }
+
+    #[test]
+    fn enter_toggles_offender_pin_in_offender_mode() {
+        let mut app = App::new();
+        seed_offender_sort_history(&mut app);
+
+        let selected_name = app
+            .selected_offender_name()
+            .expect("selected offender should exist");
+
+        app.handle_key(key_enter());
+        assert_eq!(app.offender_pinned.as_deref(), Some(selected_name.as_str()));
+
+        app.handle_key(key_enter());
+        assert!(app.offender_pinned.is_none());
+    }
+
+    #[test]
+    fn offender_enter_does_not_clear_existing_process_pin() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(20, "Mail", 4.0),
+        ]));
+
+        app.table_mode = TableMode::Processes;
+        app.handle_key(key_enter());
+        let process_pin = app
+            .pinned
+            .as_ref()
+            .expect("process should be pinned")
+            .clone();
+
+        app.table_mode = TableMode::Offenders;
+        app.handle_key(key_enter());
+        assert!(app.offender_pinned.is_some());
+
+        let still_pinned = app
+            .pinned
+            .as_ref()
+            .expect("process pin should remain while offender pinning");
+        assert_eq!(still_pinned.pid, process_pin.pid);
+        assert_eq!(still_pinned.process, process_pin.process);
+
+        app.handle_key(key_enter());
+        assert!(app.offender_pinned.is_none());
+        assert!(app.pinned.is_some());
+    }
+
+    #[test]
+    fn offender_sort_changes_visible_ordering_by_metric() {
+        let mut app = App::new();
+        seed_offender_sort_history(&mut app);
+
+        assert_eq!(
+            offender_names_in_visible_order(&mut app),
+            vec![
+                "Mail".to_string(),
+                "Slack".to_string(),
+                "Safari".to_string(),
+            ]
+        );
+
+        app.cycle_offender_sort();
+        assert_eq!(app.offender_sort, OffenderSort::Avg2m);
+        assert_eq!(
+            offender_names_in_visible_order(&mut app),
+            vec![
+                "Safari".to_string(),
+                "Mail".to_string(),
+                "Slack".to_string(),
+            ]
+        );
+
+        app.cycle_offender_sort();
+        assert_eq!(app.offender_sort, OffenderSort::Peak);
+        assert_eq!(
+            offender_names_in_visible_order(&mut app),
+            vec![
+                "Safari".to_string(),
+                "Mail".to_string(),
+                "Slack".to_string(),
+            ]
+        );
+
+        app.cycle_offender_sort();
+        assert_eq!(app.offender_sort, OffenderSort::Share);
+        assert_eq!(
+            offender_names_in_visible_order(&mut app),
+            vec![
+                "Mail".to_string(),
+                "Slack".to_string(),
+                "Safari".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn offender_sort_cycle_preserves_selected_name_when_possible() {
+        let mut app = App::new();
+        seed_offender_sort_history(&mut app);
+
+        app.offender_selected = 1;
+        let selected_before = app
+            .selected_offender_name()
+            .expect("selected offender should exist");
+        assert_eq!(selected_before, "Slack");
+
+        app.handle_key(key_press('s'));
+
+        let selected_after = app
+            .selected_offender_name()
+            .expect("selected offender should still exist");
+        assert_eq!(selected_after, "Slack");
+        assert_eq!(app.offender_selected, 2);
+    }
+
+    #[test]
+    fn offender_selection_survives_snapshot_reorder_by_name() {
+        let mut app = App::new();
+        seed_offender_sort_history(&mut app);
+
+        app.offender_selected = 1;
+        assert_eq!(app.selected_offender_name().as_deref(), Some("Slack"));
+
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 30.0),
+            row(20, "Mail", 10.0),
+            row(30, "Slack", 5.0),
+        ]));
+
+        assert_eq!(app.selected_offender_name().as_deref(), Some("Slack"));
+        assert_eq!(app.offender_selected, 2);
+    }
+
+    #[test]
+    fn offender_filter_matches_group_name_only() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(101, "Safari", 12.0),
+            row(202, "Mail", 4.0),
+        ]));
+
+        app.table_mode = TableMode::Offenders;
+
+        app.offender_filter_query = "saf".to_string();
+        app.mark_offender_visible_dirty();
+        let visible_len = app.offender_visible_len();
+
+        assert_eq!(visible_len, 1);
+        let idx = app.offender_visible_indices[0];
+        assert_eq!(app.offender_rows[idx].name, "Safari");
+
+        app.offender_filter_query = "101".to_string();
+        app.mark_offender_visible_dirty();
+        assert_eq!(app.offender_visible_len(), 0);
+    }
+
+    #[test]
+    fn offender_selection_normalizes_after_filter_changes_result_size() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(20, "Mail", 6.0),
+            row(30, "Slack", 4.0),
+        ]));
+
+        app.table_mode = TableMode::Offenders;
+        assert_eq!(app.offender_visible_len(), 3);
+
+        app.offender_selected = 2;
+        app.offender_scroll = 2;
+
+        app.offender_filter_query = "mail".to_string();
+        app.mark_offender_visible_dirty();
+        let visible_len = app.offender_visible_len();
+        app.normalize_offender_selection(visible_len);
+
+        assert_eq!(visible_len, 1);
+        assert_eq!(app.offender_selected, 0);
+        assert_eq!(app.offender_scroll, 0);
+    }
+
     #[test]
     fn app_graph_scale_recovers_after_spike_leaves_viewport() {
         let app = App::new();
@@ -2488,5 +3943,44 @@ PID COMMAND POWER
     fn graph_scale_bounds_adds_headroom_for_active_history() {
         let (_, max) = graph_scale_bounds(&[39.3, 64.1, 118.8]);
         assert!(max > 118.8);
+    }
+
+    #[test]
+    fn loaded_session_cache_skips_live_hydration_when_gap_is_too_large() {
+        let mut app = App::new();
+        let mut archive = persistence::ArchiveState::default();
+        archive.record_sample(
+            100,
+            persistence::continuity_threshold_secs(REFRESH_EVERY),
+            12.0,
+            [("Safari".to_string(), 12.0)],
+        );
+
+        app.apply_loaded_session_cache(persistence::LoadedSessionCache {
+            cache: persistence::SessionCache {
+                saved_at_unix_millis: 1,
+                last_tick: 42,
+                live_power_history: vec![7.0, 8.0],
+                live_snapshots: vec![persistence::LiveSnapshot {
+                    tick: 42,
+                    samples: vec![persistence::LiveProcessSample {
+                        pid: 10,
+                        process: "Safari".to_string(),
+                        power: 8.0,
+                    }],
+                }],
+                archive: archive.clone(),
+            },
+            gap_millis: 99_999,
+            hydrate_live: false,
+        });
+
+        assert!(app.power_history.is_empty());
+        assert!(app.live_snapshot_history.is_empty());
+        assert_eq!(app.tick, 0);
+        assert_eq!(app.history_store.name_current("Safari"), 0.0);
+        assert_eq!(app.archive, archive);
+        assert!(app.loading);
+        assert!(app.snapshot.rows.is_empty());
     }
 }
