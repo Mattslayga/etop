@@ -39,30 +39,46 @@ Palette cues used in the TUI:
   - type to edit filter
   - `Enter` apply
   - `Esc` cancel edit and keep current filter
-- `space` pause/resume refresh
+- `p` pause/resume refresh
 - `Enter` pin/unpin process details
-- `t` open graph-threshold settings modal
+- `m` open graph-threshold settings modal
   - `↑/↓` or `j/k` move fields
   - `Enter` edit/confirm field value
-  - `t` apply settings and close
+  - `m` apply settings and close
   - `Esc` cancel field edit or close without applying
 
-## Run
+## Platform support
+
+- Runtime/data semantics are macOS-specific (`top -l ...`), so `etop` is a macOS tool.
+- Release artifacts are currently **Apple Silicon macOS only** (`aarch64-apple-darwin`).
+- Linux artifacts are intentionally **not** published yet.
+
+## Install / run from source
 
 ```bash
+# interactive TUI
 cargo run
+
+# non-interactive smoke mode (prints rows once and exits)
+cargo run -- --dump-once
+
+# optional: optimized local binary
+cargo build --release
+./target/release/etop
 ```
 
-## Non-interactive smoke mode
+## Install / run from GitHub Releases (Apple Silicon macOS)
 
 ```bash
-cargo run -- --dump-once
-```
+# replace <owner>, <repo>, and vX.Y.Z
+curl -L -o etop.tar.gz \
+  https://github.com/<owner>/<repo>/releases/download/vX.Y.Z/etop-vX.Y.Z-macos-aarch64.tar.gz
 
-Prints top rows once and exits.
+tar -xzf etop.tar.gz
+./etop
+```
 
 ## Notes
 
-- macOS only (`top -l` semantics)
 - Internal collector processes (`etop` and sampling `top`) are hidden by PID
 - No network calls; local command execution only
