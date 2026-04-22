@@ -186,7 +186,6 @@ pub(crate) enum OffenderSort {
     Current,
     Avg2m,
     Peak,
-    Share,
 }
 
 impl OffenderSort {
@@ -194,8 +193,7 @@ impl OffenderSort {
         match self {
             Self::Current => Self::Avg2m,
             Self::Avg2m => Self::Peak,
-            Self::Peak => Self::Share,
-            Self::Share => Self::Current,
+            Self::Peak => Self::Current,
         }
     }
 
@@ -204,24 +202,6 @@ impl OffenderSort {
             Self::Current => "current",
             Self::Avg2m => "avg2m",
             Self::Peak => "peak",
-            Self::Share => "share",
-        }
-    }
-
-    fn sort_by_label(self) -> &'static str {
-        match self {
-            Self::Current => "NOW↓",
-            Self::Avg2m => "AVG2M↓",
-            Self::Peak => "PEAK↓",
-            Self::Share => "SHARE↓",
-        }
-    }
-
-    pub(crate) fn header_label(self, column: Self, default: &'static str) -> &'static str {
-        if self == column {
-            self.sort_by_label()
-        } else {
-            default
         }
     }
 
@@ -230,7 +210,6 @@ impl OffenderSort {
             Self::Current => b.current.partial_cmp(&a.current),
             Self::Avg2m => b.avg.partial_cmp(&a.avg),
             Self::Peak => b.peak.partial_cmp(&a.peak),
-            Self::Share => b.share.partial_cmp(&a.share),
         }
         .unwrap_or(Ordering::Equal);
 
@@ -238,7 +217,6 @@ impl OffenderSort {
             .then_with(|| b.current.partial_cmp(&a.current).unwrap_or(Ordering::Equal))
             .then_with(|| b.avg.partial_cmp(&a.avg).unwrap_or(Ordering::Equal))
             .then_with(|| b.peak.partial_cmp(&a.peak).unwrap_or(Ordering::Equal))
-            .then_with(|| b.share.partial_cmp(&a.share).unwrap_or(Ordering::Equal))
             .then_with(|| a.name.cmp(&b.name))
     }
 }
@@ -399,7 +377,6 @@ impl App {
                 self.tick,
                 OFFENDER_AVG_WINDOW_TICKS,
                 OFFENDER_PEAK_WINDOW_TICKS,
-                self.snapshot.total_power,
                 usize::MAX,
             )
             .into_iter()
@@ -1030,14 +1007,14 @@ impl App {
             "Enter apply • Esc cancel"
         } else if self.table_mode == TableMode::Offenders {
             if self.offender_pinned.is_some() {
-                "Enter unpin • / filter • s sort • 3 processes • 4 offender range • space pause"
+                "Enter unpin • 4 range"
             } else {
-                "j/k move • g/G jump • / filter • Enter pin • s sort • 3 processes • space pause"
+                "Enter pin • s sort"
             }
         } else if self.pinned.is_some() {
-            "Enter unpin • / filter • 3 offenders • space pause"
+            "Enter unpin"
         } else {
-            "j/k move • g/G jump • / filter • Enter pin • 3 offenders • space pause"
+            "Enter pin"
         }
     }
 
@@ -1078,7 +1055,7 @@ impl App {
             KeyCode::Char('g') if can_navigate => self.select_top(),
             KeyCode::Char('G') if can_navigate => self.select_bottom(),
             KeyCode::Char('/') => self.start_filter_input(),
-            KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_pause(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
             KeyCode::Char('1') => self.show_graph = !self.show_graph,
             KeyCode::Char('2') => self.show_table = !self.show_table,

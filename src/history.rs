@@ -93,7 +93,6 @@ pub struct NameOffenderMetrics {
     pub current: f64,
     pub avg: f64,
     pub peak: f64,
-    pub share: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -181,16 +180,6 @@ impl HistoryStore {
             .unwrap_or(0.0)
     }
 
-    #[allow(dead_code)]
-    pub fn pid_share(&self, key: &PidKey, total_power: f64) -> f64 {
-        let current = self.pid_current(key);
-        if total_power <= 0.0 {
-            0.0
-        } else {
-            current / total_power
-        }
-    }
-
     pub fn pid_recent_values(&self, key: &PidKey, window_ticks: u64, now_tick: u64) -> Vec<f64> {
         let min_tick = now_tick.saturating_sub(window_ticks.saturating_sub(1));
         self.by_pid
@@ -219,15 +208,6 @@ impl HistoryStore {
             .unwrap_or(0.0)
     }
 
-    pub fn name_share(&self, name: &str, total_power: f64) -> f64 {
-        let current = self.name_current(name);
-        if total_power <= 0.0 {
-            0.0
-        } else {
-            current / total_power
-        }
-    }
-
     pub fn name_recent_values(&self, name: &str, window_ticks: u64, now_tick: u64) -> Vec<f64> {
         let min_tick = now_tick.saturating_sub(window_ticks.saturating_sub(1));
         self.by_name
@@ -241,7 +221,6 @@ impl HistoryStore {
         now_tick: u64,
         avg_window_ticks: u64,
         peak_window_ticks: u64,
-        total_power: f64,
         limit: usize,
     ) -> Vec<NameOffenderMetrics> {
         let mut offenders: Vec<NameOffenderMetrics> = self
@@ -252,7 +231,6 @@ impl HistoryStore {
                 current: self.name_current(name),
                 avg: self.name_avg(name, avg_window_ticks, now_tick),
                 peak: self.name_peak(name, peak_window_ticks, now_tick),
-                share: self.name_share(name, total_power),
             })
             .collect();
 
@@ -348,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_avg_peak_and_share() {
+    fn computes_avg_and_peak() {
         let mut store = HistoryStore::new(16, 16);
 
         store.update(1, [s(10, "Safari", 2.0)]);
@@ -357,7 +335,6 @@ mod tests {
 
         assert_eq!(store.name_avg("Safari", 2, 3), 5.0);
         assert_eq!(store.name_peak("Safari", 3, 3), 6.0);
-        assert!((store.name_share("Safari", 12.0) - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -393,11 +370,10 @@ mod tests {
             ],
         );
 
-        let offenders = store.top_name_offenders(2, 2, 2, 10.5, 3);
+        let offenders = store.top_name_offenders(2, 2, 2, 3);
         assert_eq!(offenders.len(), 3);
         assert_eq!(offenders[0].name, "Safari");
         assert_eq!(offenders[1].name, "Mail");
         assert_eq!(offenders[2].name, "Slack");
-        assert!((offenders[0].share - (4.0 / 10.5)).abs() < 1e-9);
     }
 }

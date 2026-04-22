@@ -509,6 +509,34 @@ fn chip_line(label: &str, hotkey: Option<char>) -> Vec<Span<'static>> {
     spans
 }
 
+fn draw_chips_on_border_right(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    end_x: u16,
+    chips: &[Vec<Span<'_>>],
+) {
+    if chips.is_empty() || area.width == 0 {
+        return;
+    }
+    let total_width: u16 = chips
+        .iter()
+        .map(|chip| {
+            let inner: u16 = chip
+                .iter()
+                .map(|span| span.content.chars().count() as u16)
+                .sum();
+            inner + 2
+        })
+        .sum();
+    let left_bound = area.x + 1;
+    if end_x <= left_bound + total_width {
+        return;
+    }
+    let start_x = end_x.saturating_sub(total_width);
+    draw_chips_on_border(buf, area, y, start_x, chips);
+}
+
 fn draw_chips_on_border(
     buf: &mut Buffer,
     area: Rect,
@@ -590,6 +618,106 @@ fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
     thresholds.color_for_power(power)
 }
 
+const PIN_MARKER: &str = "▍";
+
+fn pin_marker_cell(is_pinned: bool) -> Cell<'static> {
+    if is_pinned {
+        Cell::from(Span::styled(
+            PIN_MARKER,
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(" ")
+    }
+}
+
+fn sort_header_cell(label: &'static str, active: bool, _width: u16) -> Cell<'static> {
+    let label_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let arrow_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    let (arrow, a_style) = if active {
+        ("↓", arrow_style)
+    } else {
+        (" ", Style::default())
+    };
+    Cell::from(Line::from(vec![
+        Span::styled(label, label_style),
+        Span::styled(arrow, a_style),
+    ]))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TableLayout {
+    show_pid: bool,
+    show_avg: bool,
+    show_peak: bool,
+    trend_width: u16,
+}
+
+fn compute_process_col_width(panel_width: u16) -> u16 {
+    let inner = panel_width.saturating_sub(4);
+    if inner < 40 {
+        20
+    } else if inner < 80 {
+        24
+    } else if inner < 120 {
+        28
+    } else {
+        32
+    }
+}
+
+impl TableLayout {
+    fn for_processes(width: u16) -> Self {
+        Self {
+            show_pid: width >= 60,
+            show_avg: true,
+            show_peak: true,
+            trend_width: trend_column_width(width),
+        }
+    }
+
+    fn for_offenders(width: u16) -> Self {
+        Self {
+            show_pid: false,
+            show_avg: width >= 70,
+            show_peak: width >= 56,
+            trend_width: trend_column_width(width),
+        }
+    }
+}
+
+fn trend_column_width(panel_width: u16) -> u16 {
+    if panel_width >= 140 {
+        24
+    } else if panel_width >= 110 {
+        18
+    } else if panel_width >= 90 {
+        14
+    } else {
+        0
+    }
+}
+
+fn trend_sparkline_cell(samples: &[f64], width: u16) -> Cell<'static> {
+    let w = width as usize;
+    if w == 0 || samples.is_empty() {
+        return Cell::from("");
+    }
+    let (scale_min, scale_max) = graph_scale_bounds(samples);
+    let mut lines = braille_history_lines_with_scale(samples, w, 1, scale_min, scale_max);
+    if lines.is_empty() {
+        return Cell::from("");
+    }
+    Cell::from(lines.remove(0))
+}
+
 fn draw_ui(frame: &mut Frame, app: &mut App) {
     app.rebuild_process_visible_if_needed();
     app.rebuild_offender_visible_if_needed();
@@ -651,25 +779,17 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         (false, false) => unreachable!(),
     };
 
-    let mode = if app.paused { "PAUSED" } else { "LIVE" };
-    let mode_style = if app.paused {
-        Style::default()
-            .fg(COLOR_YELLOW)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(COLOR_GREEN)
-            .add_modifier(Modifier::BOLD)
-    };
+    let paused_chip_style = Style::default()
+        .fg(COLOR_YELLOW)
+        .add_modifier(Modifier::BOLD);
+    let loading_chip_style = Style::default()
+        .fg(COLOR_YELLOW)
+        .add_modifier(Modifier::BOLD);
 
-    let load_state = if app.loading { "loading" } else { "ready" };
-    let load_style = if app.loading {
-        Style::default().fg(COLOR_YELLOW)
-    } else {
-        Style::default().fg(COLOR_GREEN)
-    };
-
-    if let Some(graph_area) = graph_slot {
+    if let Some(graph_area) = graph_slot
+        && graph_area.height >= 3
+        && graph_area.width >= 3
+    {
         let graph_inner = panel_block().inner(graph_area);
         let graph_width = graph_inner.width as usize;
         let graph_height = graph_inner.height as usize;
@@ -683,25 +803,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             scale_min,
             scale_max,
         );
-        let graph_point_count = app.power_history.len();
-
-        let graph_title_right = Line::from(vec![
-            Span::styled("power ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{:.1}", app.snapshot.total_power),
-                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " • 8m • {} pts • {:.1}–{:.1}",
-                    graph_point_count, scale_min, scale_max
-                ),
-                Style::default().fg(COLOR_MUTED),
-            ),
-        ])
-        .right_aligned();
-
-        let mut graph_bottom_spans = hotkey_hint_line("space pause").spans;
+        let mut graph_bottom_spans = hotkey_hint_line("p pause").spans;
         if let Some(error) = app.last_error.as_deref() {
             graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
             graph_bottom_spans.push(Span::styled(
@@ -709,28 +811,25 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(COLOR_RED),
             ));
         }
-        let graph_block = panel_block()
-            .title_top(graph_title_right)
-            .title_bottom(Line::from(graph_bottom_spans).right_aligned());
+        let graph_block =
+            panel_block().title_bottom(Line::from(graph_bottom_spans).right_aligned());
         frame.render_widget(graph_block, graph_area);
 
-        let graph_chips = vec![
-            chip_line("¹etop", Some('¹')),
-            {
-                let mut spans = chip_line(mode, None);
-                for span in &mut spans {
-                    span.style = span.style.patch(mode_style);
-                }
-                spans
-            },
-            {
-                let mut spans = chip_line(load_state, None);
-                for span in &mut spans {
-                    span.style = span.style.patch(load_style);
-                }
-                spans
-            },
-        ];
+        let mut graph_chips: Vec<Vec<Span<'static>>> = vec![chip_line("¹etop", Some('¹'))];
+        if app.paused {
+            let mut spans = chip_line("PAUSED", None);
+            for span in &mut spans {
+                span.style = span.style.patch(paused_chip_style);
+            }
+            graph_chips.push(spans);
+        }
+        if app.loading {
+            let mut spans = chip_line("LOADING", None);
+            for span in &mut spans {
+                span.style = span.style.patch(loading_chip_style);
+            }
+            graph_chips.push(spans);
+        }
         let border_y = graph_area.y;
         draw_chips_on_border(
             frame.buffer_mut(),
@@ -738,6 +837,27 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             border_y,
             graph_area.x + 1,
             &graph_chips,
+        );
+
+        let power_chip: Vec<Span<'static>> = vec![
+            Span::styled("power ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.1}", app.snapshot.total_power),
+                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let scale_chip: Vec<Span<'static>> = vec![Span::styled(
+            format!("{:.0}–{:.0}", scale_min, scale_max),
+            Style::default().fg(COLOR_MUTED),
+        )];
+        let right_chips = vec![power_chip, scale_chip];
+        let right_edge = graph_area.x + graph_area.width.saturating_sub(1);
+        draw_chips_on_border_right(
+            frame.buffer_mut(),
+            graph_area,
+            border_y,
+            right_edge,
+            &right_chips,
         );
 
         let graph_bottom_chips = vec![chip_line("menu", Some('m'))];
@@ -750,12 +870,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             &graph_bottom_chips,
         );
 
-        debug_assert!(graph_height > 0 || graph_width == 0);
         let graph = Paragraph::new(graph_lines);
         frame.render_widget(graph, graph_inner);
     }
 
-    let Some(table_region) = table_slot else {
+    let Some(table_region) = table_slot.filter(|r| r.height >= 3 && r.width >= 3) else {
         if let Some(modal) = app.settings_modal.as_ref() {
             draw_settings_modal(frame, modal);
         }
@@ -803,12 +922,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
             let text_lines: Vec<Line> = match (pinned.as_ref(), pinned_row.as_ref()) {
                 (Some(_), Some(row)) => {
-                    let power_share = if app.snapshot.total_power > 0.0 {
-                        (row.power_num / app.snapshot.total_power) * 100.0
-                    } else {
-                        0.0
-                    };
-
                     let rank_text = pinned_rank
                         .map(|rank| format!("#{} / {}", rank + 1, process_visible_len))
                         .unwrap_or_else(|| "not in current filtered list".to_string());
@@ -830,11 +943,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                                         &app.settings.graph_heat,
                                     ))
                                     .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(
-                                format!("{power_share:.1}%"),
-                                Style::default().fg(COLOR_FG),
                             ),
                             Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(rank_text, Style::default().fg(COLOR_FG)),
@@ -916,43 +1024,56 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             (start + rows_visible).min(process_visible_len)
         };
 
+        let layout = TableLayout::for_processes(rows_area.width);
         let graph_heat = app.settings.graph_heat.clone();
-        let rows = app.process_visible_indices[start..end].iter().map(|idx| {
-            let r = &app.snapshot.rows[*idx];
-            let is_pinned_row = pinned
-                .as_ref()
-                .map(|pin| pin.pid == r.pid && pin.process == r.process)
-                .unwrap_or(false);
+        let trend_width = layout.trend_width;
+        let current_tick = app.tick;
+        let rows = app.process_visible_indices[start..end]
+            .iter()
+            .map(|idx| {
+                let r = &app.snapshot.rows[*idx];
+                let is_pinned_row = pinned
+                    .as_ref()
+                    .map(|pin| pin.pid == r.pid && pin.process == r.process)
+                    .unwrap_or(false);
 
-            let row_style = if is_pinned_row {
-                Style::default()
-                    .bg(COLOR_SELECTED_BG)
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(COLOR_FG)
-            };
+                let mut cells: Vec<Cell<'static>> = Vec::with_capacity(5);
+                cells.push(pin_marker_cell(is_pinned_row));
+                if layout.show_pid {
+                    cells.push(Cell::from(r.pid.to_string()));
+                }
+                cells.push(Cell::from(r.process.clone()));
+                cells.push(
+                    Cell::from(r.power.clone())
+                        .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
+                );
+                if trend_width > 0 {
+                    let key = PidKey::new(r.pid, r.process.clone());
+                    let samples = app.history_store.pid_recent_values(
+                        &key,
+                        trend_width as u64 * 2,
+                        current_tick,
+                    );
+                    cells.push(trend_sparkline_cell(&samples, trend_width));
+                }
+                Row::new(cells)
+            })
+            .collect::<Vec<_>>();
 
-            Row::new([
-                Cell::from(r.pid.to_string()),
-                Cell::from(r.process.clone()),
-                Cell::from(r.power.clone())
-                    .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
-            ])
-            .style(row_style)
-        });
-
-        let header_row = Row::new([
-            Cell::from("PID"),
-            Cell::from("PROCESS"),
-            Cell::from("POWER"),
-        ])
-        .style(
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .bg(COLOR_SELECTED_BG)
-                .add_modifier(Modifier::BOLD),
-        );
+        let header_style = Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD);
+        let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(5);
+        header_cells.push(Cell::from(" "));
+        if layout.show_pid {
+            header_cells.push(Cell::from("PID"));
+        }
+        header_cells.push(Cell::from("PROCESS"));
+        header_cells.push(Cell::from("POWER"));
+        if layout.trend_width > 0 {
+            header_cells.push(Cell::from("TREND"));
+        }
+        let header_row = Row::new(header_cells).style(header_style);
 
         let pin_suffix = pinned
             .as_ref()
@@ -981,13 +1102,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             )
         };
 
-        let highlight_style = if app.is_pinned() {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-                .bg(COLOR_SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        };
+        let highlight_style = Style::default()
+            .bg(COLOR_SELECTED_BG)
+            .add_modifier(Modifier::BOLD);
 
         let table_block = panel_block()
             .title_top(
@@ -999,19 +1116,23 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             )
             .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(7),
-                Constraint::Percentage(70),
-                Constraint::Length(10),
-            ],
-        )
-        .header(header_row)
-        .block(table_block)
-        .column_spacing(1)
-        .style(Style::default().fg(COLOR_FG))
-        .row_highlight_style(highlight_style);
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(5);
+        constraints.push(Constraint::Length(1));
+        if layout.show_pid {
+            constraints.push(Constraint::Length(7));
+        }
+        constraints.push(Constraint::Min(10));
+        constraints.push(Constraint::Length(10));
+        if layout.trend_width > 0 {
+            constraints.push(Constraint::Length(layout.trend_width));
+        }
+
+        let table = Table::new(rows, constraints)
+            .header(header_row)
+            .block(table_block)
+            .column_spacing(1)
+            .style(Style::default().fg(COLOR_FG))
+            .row_highlight_style(highlight_style);
 
         let selected_in_window = if process_visible_len == 0 || app.is_pinned() {
             None
@@ -1056,8 +1177,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                     let peak =
                         app.history_store
                             .name_peak(name, OFFENDER_PEAK_WINDOW_TICKS, app.tick);
-                    let share =
-                        app.history_store.name_share(name, app.snapshot.total_power) * 100.0;
 
                     let rank_text = offender_pinned_visible_rank
                         .map(|rank| format!("#{} / {}", rank + 1, offender_visible_len))
@@ -1089,8 +1208,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                             Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
                             Span::styled("  peak2m ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  live share ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{share:.1}%"), Style::default().fg(COLOR_FG)),
                             Span::styled("  live rank ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(rank_text, Style::default().fg(COLOR_FG)),
                         ]));
@@ -1144,8 +1261,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                             Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
                             Span::styled("  peak ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  share ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{share:.1}%"), Style::default().fg(COLOR_FG)),
                             Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
                             Span::styled(rank_text, Style::default().fg(COLOR_FG)),
                         ]));
@@ -1239,47 +1354,85 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             (start + rows_visible).min(offender_visible_len)
         };
 
-        let rows = app.offender_visible_indices[start..end].iter().map(|idx| {
-            let offender = &app.offender_rows[*idx];
-            let is_pinned_row = offender_pinned
-                .as_ref()
-                .map(|name| name == &offender.name)
-                .unwrap_or(false);
+        let layout = TableLayout::for_offenders(rows_area.width);
+        let heat = app.settings.graph_heat.clone();
+        let sort = app.offender_sort;
+        let trend_width = layout.trend_width;
+        let current_tick = app.tick;
+        let rows = app.offender_visible_indices[start..end]
+            .iter()
+            .map(|idx| {
+                let offender = &app.offender_rows[*idx];
+                let is_pinned_row = offender_pinned
+                    .as_ref()
+                    .map(|name| name == &offender.name)
+                    .unwrap_or(false);
 
-            let row_style = if is_pinned_row {
-                Style::default()
-                    .bg(COLOR_SELECTED_BG)
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(COLOR_FG)
-            };
+                let mut cells: Vec<Cell<'static>> = Vec::with_capacity(6);
+                cells.push(pin_marker_cell(is_pinned_row));
+                cells.push(Cell::from(offender.name.clone()));
+                cells.push(
+                    Cell::from(format!("{:.1}", offender.current))
+                        .style(Style::default().fg(spectrum_band_color(offender.current, &heat))),
+                );
+                if layout.show_avg {
+                    cells.push(Cell::from(format!("{:.1}", offender.avg)));
+                }
+                if layout.show_peak {
+                    cells.push(Cell::from(format!("{:.1}", offender.peak)));
+                }
+                if trend_width > 0 {
+                    let samples = app.history_store.name_recent_values(
+                        &offender.name,
+                        trend_width as u64 * 2,
+                        current_tick,
+                    );
+                    cells.push(trend_sparkline_cell(&samples, trend_width));
+                }
+                Row::new(cells)
+            })
+            .collect::<Vec<_>>();
 
-            Row::new([
-                Cell::from(offender.name.clone()),
-                Cell::from(format!("{:.1}", offender.current)).style(Style::default().fg(
-                    spectrum_band_color(offender.current, &app.settings.graph_heat),
-                )),
-                Cell::from(format!("{:.1}", offender.avg)),
-                Cell::from(format!("{:.1}", offender.peak)),
-                Cell::from(format!("{:>5.1}%", offender.share * 100.0)),
-            ])
-            .style(row_style)
-        });
+        let now_width: u16 = 8;
+        let avg_width: u16 = 8;
+        let peak_width: u16 = 8;
 
-        let header_row = Row::new([
-            Cell::from("PROCESS"),
-            Cell::from(app.offender_sort.header_label(OffenderSort::Current, "NOW")),
-            Cell::from(app.offender_sort.header_label(OffenderSort::Avg2m, "AVG2M")),
-            Cell::from(app.offender_sort.header_label(OffenderSort::Peak, "PEAK")),
-            Cell::from(app.offender_sort.header_label(OffenderSort::Share, "SHARE")),
-        ])
-        .style(
+        let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(5);
+        header_cells.push(Cell::from(" "));
+        header_cells.push(Cell::from(Span::styled(
+            "PROCESS",
             Style::default()
                 .fg(COLOR_ACCENT)
-                .bg(COLOR_SELECTED_BG)
                 .add_modifier(Modifier::BOLD),
-        );
+        )));
+        header_cells.push(sort_header_cell(
+            "NOW",
+            sort == OffenderSort::Current,
+            now_width,
+        ));
+        if layout.show_avg {
+            header_cells.push(sort_header_cell(
+                "AVG2M",
+                sort == OffenderSort::Avg2m,
+                avg_width,
+            ));
+        }
+        if layout.show_peak {
+            header_cells.push(sort_header_cell(
+                "PEAK",
+                sort == OffenderSort::Peak,
+                peak_width,
+            ));
+        }
+        if layout.trend_width > 0 {
+            header_cells.push(Cell::from(Span::styled(
+                "TREND",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        let header_row = Row::new(header_cells);
 
         let pin_suffix = offender_pinned
             .as_ref()
@@ -1288,33 +1441,29 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
         let table_title_right = if app.offender_filter_input.is_some() {
             format!(
-                "{offender_visible_len}/{offender_total} groups • filter edit: {} • sort: {}{}",
+                "{offender_visible_len}/{offender_total} • filter edit: {} • sort {}{}",
                 app.offender_active_filter(),
                 app.offender_sort.title_label(),
                 pin_suffix,
             )
         } else if app.offender_filter_query.is_empty() {
             format!(
-                "{offender_visible_len}/{offender_total} groups • offender view • sort: {}{}",
+                "{offender_visible_len}/{offender_total} • sort {}{}",
                 app.offender_sort.title_label(),
                 pin_suffix,
             )
         } else {
             format!(
-                "{offender_visible_len}/{offender_total} groups • filter: {} • sort: {}{}",
+                "{offender_visible_len}/{offender_total} • filter: {} • sort {}{}",
                 app.offender_filter_query,
                 app.offender_sort.title_label(),
                 pin_suffix,
             )
         };
 
-        let highlight_style = if app.is_offender_pinned() {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-                .bg(COLOR_SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        };
+        let highlight_style = Style::default()
+            .bg(COLOR_SELECTED_BG)
+            .add_modifier(Modifier::BOLD);
 
         let table_block = panel_block()
             .title_top(
@@ -1326,21 +1475,27 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             )
             .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(52),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-            ],
-        )
-        .header(header_row)
-        .block(table_block)
-        .column_spacing(1)
-        .style(Style::default().fg(COLOR_FG))
-        .row_highlight_style(highlight_style);
+        let process_col_width = compute_process_col_width(rows_area.width);
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(6);
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Min(process_col_width));
+        constraints.push(Constraint::Length(now_width));
+        if layout.show_avg {
+            constraints.push(Constraint::Length(avg_width));
+        }
+        if layout.show_peak {
+            constraints.push(Constraint::Length(peak_width));
+        }
+        if layout.trend_width > 0 {
+            constraints.push(Constraint::Length(layout.trend_width));
+        }
+
+        let table = Table::new(rows, constraints)
+            .header(header_row)
+            .block(table_block)
+            .column_spacing(1)
+            .style(Style::default().fg(COLOR_FG))
+            .row_highlight_style(highlight_style);
 
         let selected_in_window = if offender_visible_len == 0 || app.is_offender_pinned() {
             None
@@ -1415,15 +1570,15 @@ fn draw_easter_egg(
     let chips = vec![chip_line("etop", None)];
     draw_chips_on_border(frame.buffer_mut(), area, area.y, area.x + 1, &chips);
 
-    if inner.width < 12 || inner.height < 7 {
+    let spark_height: u16 = 5;
+    let stack_height: u16 = 1 /* power value */ + 1 /* spacer */ + spark_height + 1 /* spacer */ + 1 /* hint */;
+    if inner.width < 12 || inner.height < stack_height {
         return;
     }
 
-    let spark_width = (inner.width * 2 / 3).max(20);
-    let spark_height: u16 = 5;
-    let stack_height = 1 /* power value */ + 1 /* spacer */ + spark_height + 1 /* spacer */ + 1 /* hint */;
+    let spark_width = (inner.width * 2 / 3).max(20).min(inner.width);
     let start_x = inner.x + (inner.width.saturating_sub(spark_width)) / 2;
-    let start_y = inner.y + inner.height.saturating_sub(stack_height) / 2;
+    let start_y = inner.y + (inner.height - stack_height) / 2;
 
     let power_style = Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD);
     let unit_style = Style::default().fg(COLOR_MUTED);
@@ -1716,9 +1871,6 @@ mod tests {
         assert_eq!(app.offender_sort, OffenderSort::Peak);
 
         app.handle_key(key_press('s'));
-        assert_eq!(app.offender_sort, OffenderSort::Share);
-
-        app.handle_key(key_press('s'));
         assert_eq!(app.offender_sort, OffenderSort::Current);
     }
 
@@ -1906,15 +2058,7 @@ mod tests {
         );
 
         app.cycle_offender_sort();
-        assert_eq!(app.offender_sort, OffenderSort::Share);
-        assert_eq!(
-            offender_names_in_visible_order(&mut app),
-            vec![
-                "Mail".to_string(),
-                "Slack".to_string(),
-                "Safari".to_string(),
-            ]
-        );
+        assert_eq!(app.offender_sort, OffenderSort::Current);
     }
 
     #[test]
