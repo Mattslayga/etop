@@ -56,6 +56,13 @@ Palette cues used in the TUI:
 ## Install with Homebrew (Apple Silicon macOS)
 
 ```bash
+brew tap Mattslayga/etop
+brew install etop
+```
+
+One-line equivalent:
+
+```bash
 brew install Mattslayga/etop/etop
 ```
 
