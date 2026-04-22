@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +31,7 @@ jobs:
           tar -C dist -czf "etop-${{ github.ref_name }}-macos-aarch64.tar.gz" etop
 
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: etop-${{ github.ref_name }}-macos-aarch64.tar.gz
           generate_release_notes: true
