@@ -53,6 +53,14 @@ Palette cues used in the TUI:
 - Release artifacts are currently **Apple Silicon macOS only** (`aarch64-apple-darwin`).
 - Linux artifacts are intentionally **not** published yet.
 
+## Install with Homebrew (Apple Silicon macOS)
+
+```bash
+brew install Mattslayga/etop/etop
+```
+
+This installs the current Apple Silicon macOS release from the `Mattslayga/homebrew-etop` tap.
+
 ## Install / run from source
 
 ```bash
@@ -77,6 +85,10 @@ curl -L -o etop.tar.gz \
 tar -xzf etop.tar.gz
 ./etop
 ```
+
+## License
+
+MIT
 
 ## Notes
 
