@@ -6,7 +6,8 @@ use std::{
 use crate::persistence;
 
 const TOP_BIN: &str = "top";
-const TOP_ARGS: [&str; 8] = [
+pub(crate) const TOP_NCOLS: &str = "240";
+const TOP_ARGS: [&str; 10] = [
     "-l",
     "2",
     "-s",
@@ -15,6 +16,8 @@ const TOP_ARGS: [&str; 8] = [
     "power",
     "-stats",
     "pid,command,power",
+    "-ncols",
+    TOP_NCOLS,
 ];
 const MAX_REASONABLE_POWER: f64 = 10_000.0;
 

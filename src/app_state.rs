@@ -658,6 +658,13 @@ impl App {
         self.mark_process_rows_dirty();
     }
 
+    fn clear_filter(&mut self) {
+        self.process_filter_query.clear();
+        self.process_selected = 0;
+        self.process_scroll = 0;
+        self.mark_process_rows_dirty();
+    }
+
     fn handle_filter_key(&mut self, key: KeyEvent) {
         let Some(buf) = self.process_filter_input.as_mut() else {
             return;
@@ -749,6 +756,11 @@ impl App {
             KeyCode::Char('g') if can_navigate => self.select_top(),
             KeyCode::Char('G') if can_navigate => self.select_bottom(),
             KeyCode::Char('f') | KeyCode::Char('F') if self.show_table => self.start_filter_input(),
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if self.show_table && !self.process_filter_query.is_empty() =>
+            {
+                self.clear_filter()
+            }
             KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_pause(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
             KeyCode::Char('1') => self.show_graph = !self.show_graph,

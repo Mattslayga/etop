@@ -34,7 +34,7 @@ use ratatui::{
 };
 #[cfg(test)]
 use top_parse::{ProcRow, snapshot_from_rows};
-use top_parse::{Snapshot, TopStreamParser, fetch_snapshot};
+use top_parse::{Snapshot, TOP_NCOLS, TopStreamParser, fetch_snapshot};
 
 const TOP_BIN: &str = "top";
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
@@ -95,7 +95,7 @@ fn main() -> io::Result<()> {
                         .unwrap_or(Ordering::Equal)
                 });
                 for row in rows.into_iter().take(10) {
-                    println!("{:>6}  {:<32}  {:>8}", row.pid, row.process, row.power);
+                    println!("{:>6}  {:<48}  {:>8}", row.pid, row.process, row.power);
                 }
                 return Ok(());
             }
@@ -303,6 +303,8 @@ fn start_sampler(self_pid: Option<i32>) -> io::Result<SamplerRuntime> {
         .arg("power")
         .arg("-stats")
         .arg("pid,command,power")
+        .arg("-ncols")
+        .arg(TOP_NCOLS)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -523,6 +525,30 @@ fn action_chip_line(label: &str, hotkey: &str) -> Vec<Span<'static>> {
     ]
 }
 
+fn accent_chip_line(label: &str) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        label.to_string(),
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )]
+}
+
+fn filter_value_chip_line(value: &str, editing: bool) -> Vec<Span<'static>> {
+    let input_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+    if editing {
+        if value.is_empty() {
+            vec![Span::styled("▏", input_style)]
+        } else {
+            vec![Span::styled(format!("{value}▏"), input_style)]
+        }
+    } else {
+        vec![Span::styled(value.to_string(), input_style)]
+    }
+}
+
 fn draw_chips_on_border_right(
     buf: &mut Buffer,
     area: Rect,
@@ -679,11 +705,11 @@ fn compute_process_col_width(panel_width: u16) -> u16 {
     if inner < 40 {
         20
     } else if inner < 80 {
-        24
-    } else if inner < 120 {
         28
+    } else if inner < 120 {
+        40
     } else {
-        32
+        52
     }
 }
 
@@ -745,7 +771,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             .iter()
             .position(|row| row.key.pid == pin.pid && row.key.process == pin.process)
     });
-    let controls_blocked = app.settings_modal.is_some() || app.is_filter_input_active();
+    let controls_blocked = app.settings_modal.is_some();
+    let filter_input_active = app.is_filter_input_active();
 
     if !app.show_graph && !app.show_table {
         draw_easter_egg(
@@ -808,29 +835,55 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         }
         frame.render_widget(graph_block, graph_area);
 
-        let mut graph_chips: Vec<Vec<Span<'static>>> = vec![chip_line("¹etop", Some('¹'))];
+        let border_y = graph_area.y;
+        let title_end = draw_chips_on_border(
+            frame.buffer_mut(),
+            graph_area,
+            border_y,
+            graph_area.x + 1,
+            &[chip_line("¹etop", Some('¹'))],
+        );
+        let mut next_top_x = title_end.saturating_add(1);
+        if !controls_blocked && !filter_input_active {
+            let graph_top_controls = vec![
+                action_chip_line("menu", "m"),
+                action_chip_line("quit", "q"),
+                action_chip_line(if app.paused { "unpause" } else { "pause" }, "p"),
+            ];
+            next_top_x = draw_chips_on_border(
+                frame.buffer_mut(),
+                graph_area,
+                border_y,
+                next_top_x,
+                &graph_top_controls,
+            )
+            .saturating_add(1);
+        }
+
+        let mut graph_status_chips: Vec<Vec<Span<'static>>> = Vec::new();
         if app.paused {
             let mut spans = chip_line("PAUSED", None);
             for span in &mut spans {
                 span.style = span.style.patch(paused_chip_style);
             }
-            graph_chips.push(spans);
+            graph_status_chips.push(spans);
         }
         if app.loading {
             let mut spans = chip_line("LOADING", None);
             for span in &mut spans {
                 span.style = span.style.patch(loading_chip_style);
             }
-            graph_chips.push(spans);
+            graph_status_chips.push(spans);
         }
-        let border_y = graph_area.y;
-        draw_chips_on_border(
-            frame.buffer_mut(),
-            graph_area,
-            border_y,
-            graph_area.x + 1,
-            &graph_chips,
-        );
+        if !graph_status_chips.is_empty() {
+            draw_chips_on_border(
+                frame.buffer_mut(),
+                graph_area,
+                border_y,
+                next_top_x,
+                &graph_status_chips,
+            );
+        }
 
         let power_chip: Vec<Span<'static>> = vec![
             Span::styled("power ", Style::default().fg(COLOR_MUTED)),
@@ -852,31 +905,6 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             right_edge,
             &right_chips,
         );
-
-        let bottom_y = graph_area.y + graph_area.height.saturating_sub(1);
-        if !controls_blocked {
-            if !app.show_table {
-                let graph_bottom_left_chips =
-                    vec![action_chip_line("menu", "m"), action_chip_line("quit", "q")];
-                draw_chips_on_border(
-                    frame.buffer_mut(),
-                    graph_area,
-                    bottom_y,
-                    graph_area.x + 1,
-                    &graph_bottom_left_chips,
-                );
-            }
-
-            let graph_bottom_right_chips = vec![action_chip_line("pause", "p")];
-            let right_edge = graph_area.x + graph_area.width.saturating_sub(1);
-            draw_chips_on_border_right(
-                frame.buffer_mut(),
-                graph_area,
-                bottom_y,
-                right_edge,
-                &graph_bottom_right_chips,
-            );
-        }
 
         let graph = Paragraph::new(graph_lines);
         frame.render_widget(graph, graph_inner);
@@ -909,35 +937,42 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     };
 
     if let Some(detail_rect) = detail_area {
-        let detail_title = if let Some(pin) = pinned.as_ref() {
-            format!("pinned {}", pin.pid)
-        } else {
-            "pinned process".to_string()
-        };
-
         let archive_backed_mode = app.graph_range.archive_range().is_some();
         let detail_range_label = if archive_backed_mode {
             format!("hist {}", app.graph_range.label())
         } else {
             app.graph_range.label().to_string()
         };
-        let detail_block =
-            panel_block().title_top(format!("{detail_title} • {detail_range_label}"));
+        let detail_block = panel_block();
         let detail_inner = detail_block.inner(detail_rect);
         frame.render_widget(detail_block, detail_rect);
-        if !controls_blocked {
-            let detail_bottom_y = detail_rect.y + detail_rect.height.saturating_sub(1);
-            let detail_right_edge = detail_rect.x + detail_rect.width.saturating_sub(1);
-            let detail_bottom_chips = vec![
+        let detail_title_end = draw_chips_on_border(
+            frame.buffer_mut(),
+            detail_rect,
+            detail_rect.y,
+            detail_rect.x + 1,
+            &[
+                chip_line(
+                    &pinned
+                        .as_ref()
+                        .map(|pin| pin.pid.to_string())
+                        .unwrap_or_else(|| "process".to_string()),
+                    None,
+                ),
+                chip_line(&detail_range_label, None),
+            ],
+        );
+        if !controls_blocked && !filter_input_active {
+            let detail_top_chips = vec![
                 action_chip_line("range", "r"),
                 action_chip_line("unpin", "Enter"),
             ];
-            draw_chips_on_border_right(
+            draw_chips_on_border(
                 frame.buffer_mut(),
                 detail_rect,
-                detail_bottom_y,
-                detail_right_edge,
-                &detail_bottom_chips,
+                detail_rect.y,
+                detail_title_end.saturating_add(1),
+                &detail_top_chips,
             );
         }
 
@@ -1160,7 +1195,12 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(7);
     header_cells.push(Cell::from(" "));
     if layout.show_pid {
-        header_cells.push(Cell::from("PID"));
+        header_cells.push(Cell::from(Span::styled(
+            "PID",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     header_cells.push(Cell::from(Span::styled(
         "PROCESS",
@@ -1197,33 +1237,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     }
     let header_row = Row::new(header_cells);
 
-    let table_title_right = if app.process_filter_input.is_some() {
-        format!(
-            "{process_visible_len}/{} • filter edit: {}",
-            app.snapshot.rows.len(),
-            app.process_active_filter(),
-        )
-    } else if app.process_filter_query.is_empty() {
-        format!("{process_visible_len}/{}", app.snapshot.rows.len())
-    } else {
-        format!(
-            "{process_visible_len}/{} • filter: {}",
-            app.snapshot.rows.len(),
-            app.process_filter_query,
-        )
-    };
-
     let highlight_style = Style::default()
         .bg(COLOR_SELECTED_BG)
         .add_modifier(Modifier::BOLD);
 
-    let table_block = panel_block().title_top(
-        Line::from(Span::styled(
-            table_title_right,
-            Style::default().fg(COLOR_MUTED),
-        ))
-        .right_aligned(),
-    );
+    let table_block = panel_block();
 
     let process_col_width = compute_process_col_width(rows_area.width);
     let mut constraints: Vec<Constraint> = Vec::with_capacity(7);
@@ -1258,38 +1276,55 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let mut table_state = TableState::default().with_selected(selected_in_window);
     frame.render_stateful_widget(table, rows_area, &mut table_state);
 
-    let table_chips = vec![chip_line("²processes", Some('²'))];
-    draw_chips_on_border(
+    let table_title_end = draw_chips_on_border(
         frame.buffer_mut(),
         rows_area,
         rows_area.y,
         rows_area.x + 1,
-        &table_chips,
+        &[chip_line("²processes", Some('²'))],
+    );
+    let process_count_chip = chip_line(
+        &format!("{process_visible_len}/{}", app.snapshot.rows.len()),
+        None,
+    );
+    let right_edge = rows_area.x + rows_area.width.saturating_sub(1);
+    draw_chips_on_border_right(
+        frame.buffer_mut(),
+        rows_area,
+        rows_area.y,
+        right_edge,
+        &[process_count_chip],
     );
 
     if !controls_blocked {
-        let bottom_y = rows_area.y + rows_area.height.saturating_sub(1);
-        let bottom_left_chips = vec![
-            action_chip_line("menu", "m"),
-            action_chip_line("filter", "f"),
-            action_chip_line("quit", "q"),
-        ];
+        let table_top_chips = if filter_input_active {
+            vec![
+                action_chip_line("filter", "f"),
+                filter_value_chip_line(app.process_active_filter(), true),
+            ]
+        } else {
+            let mut chips = Vec::new();
+            if !app.show_graph {
+                chips.push(action_chip_line("menu", "m"));
+                chips.push(action_chip_line("quit", "q"));
+            }
+            chips.push(action_chip_line("filter", "f"));
+            if !app.process_filter_query.is_empty() {
+                chips.push(accent_chip_line(&app.process_filter_query));
+                chips.push(action_chip_line("del", "d"));
+            }
+            chips.push(action_chip_line("sort", "s"));
+            if !app.is_pinned() {
+                chips.push(action_chip_line("pin", "Enter"));
+            }
+            chips
+        };
         draw_chips_on_border(
             frame.buffer_mut(),
             rows_area,
-            bottom_y,
-            rows_area.x + 1,
-            &bottom_left_chips,
-        );
-
-        let bottom_right_chips = vec![action_chip_line("sort", "s")];
-        let right_edge = rows_area.x + rows_area.width.saturating_sub(1);
-        draw_chips_on_border_right(
-            frame.buffer_mut(),
-            rows_area,
-            bottom_y,
-            right_edge,
-            &bottom_right_chips,
+            rows_area.y,
+            table_title_end.saturating_add(1),
+            &table_top_chips,
         );
     }
 
@@ -1672,6 +1707,20 @@ mod tests {
 
         app.handle_key(key_press('/'));
         assert!(app.process_filter_input.is_none());
+    }
+
+    #[test]
+    fn d_key_clears_applied_filter() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(20, "Mail", 4.0),
+        ]));
+        app.process_filter_query = "saf".to_string();
+
+        app.handle_key(key_press('d'));
+
+        assert!(app.process_filter_query.is_empty());
     }
 
     #[test]
