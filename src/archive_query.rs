@@ -1,5 +1,8 @@
-use crate::persistence::{
-    AGG_10S_BUCKET_SECS, AGG_60S_BUCKET_SECS, ArchiveState, RAW_2S_BUCKET_SECS, TierSample,
+use crate::{
+    history::PidKey,
+    persistence::{
+        AGG_10S_BUCKET_SECS, AGG_60S_BUCKET_SECS, ArchiveState, RAW_2S_BUCKET_SECS, TierSample,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,11 +45,11 @@ pub(crate) fn graph_samples_for_range(
     })
 }
 
-pub(crate) fn group_graph_samples_for_range(
+pub(crate) fn pid_graph_samples_for_range(
     archive: &ArchiveState,
     range: ArchiveGraphRange,
     viewport_width: usize,
-    process_name: &str,
+    key: &PidKey,
 ) -> Vec<Option<f64>> {
     graph_samples_for_range_with(archive, range, viewport_width, |tier_sample| {
         if tier_sample.sample_count == 0 {
@@ -54,10 +57,10 @@ pub(crate) fn group_graph_samples_for_range(
         }
 
         tier_sample
-            .groups
+            .processes
             .iter()
-            .find(|group| group.name == process_name)
-            .map(|group| group.power_sum / f64::from(tier_sample.sample_count))
+            .find(|process| process.pid == key.pid && process.process == key.process)
+            .map(|process| process.power_sum / f64::from(tier_sample.sample_count))
             .unwrap_or(0.0)
     })
 }
@@ -139,9 +142,7 @@ where
 
     bins.into_iter()
         .map(|bin| {
-            if bin.force_gap {
-                None
-            } else if bin.count == 0 {
+            if bin.force_gap || bin.count == 0 {
                 None
             } else {
                 Some(bin.sum / f64::from(bin.count))
@@ -155,17 +156,15 @@ fn anchored_window_end_bucket(
     range: ArchiveGraphRange,
     points: usize,
 ) -> Option<u64> {
-    tier_for_range(archive, range)
-        .back()
-        .map(|sample| {
-            display_bucket_for_sample(
-                sample.bucket_start_secs,
-                range.bucket_secs(),
-                range.window_secs(),
-                points,
-            )
-            .saturating_add(1)
-        })
+    tier_for_range(archive, range).back().map(|sample| {
+        display_bucket_for_sample(
+            sample.bucket_start_secs,
+            range.bucket_secs(),
+            range.window_secs(),
+            points,
+        )
+        .saturating_add(1)
+    })
 }
 
 fn tier_for_range(
@@ -202,6 +201,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::persistence::ArchivedProcessPower;
 
     #[test]
     fn graph_samples_for_range_uses_averages_across_full_window() {
@@ -211,14 +211,14 @@ mod tests {
                     bucket_start_secs: 10,
                     sample_count: 2,
                     total_power_sum: 20.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 1_700,
                     sample_count: 1,
                     total_power_sum: 30.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
             ]),
@@ -241,14 +241,14 @@ mod tests {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 12.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: true,
                 },
             ]),
@@ -270,14 +270,14 @@ mod tests {
                     bucket_start_secs: 10_770,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 10_790,
                     sample_count: 2,
                     total_power_sum: 30.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
             ]),
@@ -292,25 +292,34 @@ mod tests {
     }
 
     #[test]
-    fn group_graph_samples_for_range_uses_grouped_averages_and_zero_for_absent_name() {
+    fn pid_graph_samples_for_range_uses_exact_pid_identity() {
         let archive = ArchiveState {
             raw_2s: VecDeque::from(vec![
                 TierSample {
                     bucket_start_secs: 10,
                     sample_count: 2,
                     total_power_sum: 20.0,
-                    groups: vec![crate::persistence::GroupPowerSum {
-                        name: "Safari".to_string(),
-                        power_sum: 12.0,
-                    }],
+                    processes: vec![
+                        ArchivedProcessPower {
+                            pid: 10,
+                            process: "Safari".to_string(),
+                            power_sum: 12.0,
+                        },
+                        ArchivedProcessPower {
+                            pid: 20,
+                            process: "Mail".to_string(),
+                            power_sum: 8.0,
+                        },
+                    ],
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 1_700,
                     sample_count: 2,
                     total_power_sum: 30.0,
-                    groups: vec![crate::persistence::GroupPowerSum {
-                        name: "Mail".to_string(),
+                    processes: vec![ArchivedProcessPower {
+                        pid: 20,
+                        process: "Mail".to_string(),
                         power_sum: 4.0,
                     }],
                     gap_before: false,
@@ -319,25 +328,32 @@ mod tests {
             ..ArchiveState::default()
         };
 
+        let safari_key = PidKey::new(10, "Safari");
+        let mail_key = PidKey::new(20, "Mail");
         let samples =
-            group_graph_samples_for_range(&archive, ArchiveGraphRange::Minutes30, 3, "Safari");
+            pid_graph_samples_for_range(&archive, ArchiveGraphRange::Minutes30, 3, &safari_key);
+        let mail_samples =
+            pid_graph_samples_for_range(&archive, ArchiveGraphRange::Minutes30, 3, &mail_key);
 
         assert_eq!(samples.len(), 6);
         assert_eq!(samples[0], Some(6.0));
         assert!(samples[1..5].iter().all(|value| value.is_none()));
         assert_eq!(samples[5], Some(0.0));
+        assert_eq!(mail_samples[0], Some(4.0));
+        assert_eq!(mail_samples[5], Some(2.0));
     }
 
     #[test]
-    fn group_graph_samples_for_range_preserves_real_discontinuity_gaps() {
+    fn pid_graph_samples_for_range_preserves_real_discontinuity_gaps() {
         let archive = ArchiveState {
             agg_10s: VecDeque::from(vec![
                 TierSample {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: vec![crate::persistence::GroupPowerSum {
-                        name: "Safari".to_string(),
+                    processes: vec![ArchivedProcessPower {
+                        pid: 10,
+                        process: "Safari".to_string(),
                         power_sum: 7.0,
                     }],
                     gap_before: false,
@@ -346,8 +362,9 @@ mod tests {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 12.0,
-                    groups: vec![crate::persistence::GroupPowerSum {
-                        name: "Safari".to_string(),
+                    processes: vec![ArchivedProcessPower {
+                        pid: 10,
+                        process: "Safari".to_string(),
                         power_sum: 9.0,
                     }],
                     gap_before: true,
@@ -356,8 +373,8 @@ mod tests {
             ..ArchiveState::default()
         };
 
-        let samples =
-            group_graph_samples_for_range(&archive, ArchiveGraphRange::Hours3, 4, "Safari");
+        let key = PidKey::new(10, "Safari");
+        let samples = pid_graph_samples_for_range(&archive, ArchiveGraphRange::Hours3, 4, &key);
 
         assert_eq!(samples.len(), 8);
         assert_eq!(samples[0], None);
@@ -372,14 +389,14 @@ mod tests {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 110,
                     sample_count: 1,
                     total_power_sum: 12.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: true,
                 },
             ]),
@@ -403,28 +420,28 @@ mod tests {
                     bucket_start_secs: base + 90,
                     sample_count: 1,
                     total_power_sum: 4.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 100,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 102,
                     sample_count: 1,
                     total_power_sum: 20.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 104,
                     sample_count: 1,
                     total_power_sum: 30.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
             ]),
@@ -436,7 +453,7 @@ mod tests {
             bucket_start_secs: base + 106,
             sample_count: 1,
             total_power_sum: 40.0,
-            groups: Vec::new(),
+            processes: Vec::new(),
             gap_before: false,
         });
 
@@ -468,35 +485,35 @@ mod tests {
                     bucket_start_secs: base + 90,
                     sample_count: 1,
                     total_power_sum: 4.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 100,
                     sample_count: 1,
                     total_power_sum: 10.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 102,
                     sample_count: 1,
                     total_power_sum: 20.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 104,
                     sample_count: 1,
                     total_power_sum: 30.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: base + 106,
                     sample_count: 1,
                     total_power_sum: 40.0,
-                    groups: Vec::new(),
+                    processes: Vec::new(),
                     gap_before: false,
                 },
             ]),
@@ -508,13 +525,16 @@ mod tests {
             bucket_start_secs: base + 110,
             sample_count: 1,
             total_power_sum: 50.0,
-            groups: Vec::new(),
+            processes: Vec::new(),
             gap_before: false,
         });
 
         let before_samples = graph_samples_for_range(&before, ArchiveGraphRange::Minutes30, width);
         let after_samples = graph_samples_for_range(&after, ArchiveGraphRange::Minutes30, width);
 
-        assert_eq!(&after_samples[..after_samples.len() - 1], &before_samples[1..]);
+        assert_eq!(
+            &after_samples[..after_samples.len() - 1],
+            &before_samples[1..]
+        );
     }
 }

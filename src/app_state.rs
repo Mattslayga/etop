@@ -1,27 +1,64 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, VecDeque},
-};
+use std::{cmp::Ordering, collections::VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::prelude::Color;
 
 use crate::{
     COLOR_GREEN, COLOR_ORANGE, COLOR_RED, COLOR_YELLOW, CollectorEvent, HISTORY_LIMIT,
-    HISTORY_STALE_TICKS, OFFENDER_AVG_WINDOW_TICKS, OFFENDER_PEAK_WINDOW_TICKS, REFRESH_EVERY,
+    HISTORY_STALE_TICKS, PROCESS_AVG_WINDOW_TICKS, PROCESS_PEAK_WINDOW_TICKS, REFRESH_EVERY,
     archive_query,
-    graph::{
-        GRAPH_ACTIVITY_EPSILON, GraphRange, graph_scale_bounds, history_viewport_samples_deque,
-    },
-    history::{HistoryStore, NameOffenderMetrics, ProcessSample},
+    graph::{GraphRange, graph_scale_bounds, history_viewport_samples_deque},
+    history::{HistoryStore, PidKey, ProcessSample},
     persistence,
     top_parse::{Snapshot, snapshot_from_live_snapshot},
 };
-use ratatui::prelude::Color;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PinnedProcess {
     pub(crate) pid: i32,
     pub(crate) process: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessTableRow {
+    pub(crate) key: PidKey,
+    pub(crate) current: f64,
+    pub(crate) avg: f64,
+    pub(crate) peak: f64,
+    process_lc: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSort {
+    Current,
+    Avg2m,
+    Peak,
+}
+
+impl ProcessSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Current => Self::Avg2m,
+            Self::Avg2m => Self::Peak,
+            Self::Peak => Self::Current,
+        }
+    }
+
+    fn compare(self, a: &ProcessTableRow, b: &ProcessTableRow) -> Ordering {
+        let primary = match self {
+            Self::Current => b.current.partial_cmp(&a.current),
+            Self::Avg2m => b.avg.partial_cmp(&a.avg),
+            Self::Peak => b.peak.partial_cmp(&a.peak),
+        }
+        .unwrap_or(Ordering::Equal);
+
+        primary
+            .then_with(|| b.current.partial_cmp(&a.current).unwrap_or(Ordering::Equal))
+            .then_with(|| b.avg.partial_cmp(&a.avg).unwrap_or(Ordering::Equal))
+            .then_with(|| b.peak.partial_cmp(&a.peak).unwrap_or(Ordering::Equal))
+            .then_with(|| a.key.process.cmp(&b.key.process))
+            .then_with(|| a.key.pid.cmp(&b.key.pid))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,59 +202,13 @@ impl SettingsModalState {
     }
 
     pub(crate) fn display_value(&self, field: SettingsField) -> String {
-        if let Some(edit) = self.editing.as_ref() {
-            if edit.field == field {
-                return edit.buffer.clone();
-            }
+        if let Some(edit) = self.editing.as_ref()
+            && edit.field == field
+        {
+            return edit.buffer.clone();
         }
 
         format_setting_value(field.value(&self.draft))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TableMode {
-    Processes,
-    Offenders,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OffenderSort {
-    Current,
-    Avg2m,
-    Peak,
-}
-
-impl OffenderSort {
-    fn next(self) -> Self {
-        match self {
-            Self::Current => Self::Avg2m,
-            Self::Avg2m => Self::Peak,
-            Self::Peak => Self::Current,
-        }
-    }
-
-    pub(crate) fn title_label(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::Avg2m => "avg2m",
-            Self::Peak => "peak",
-        }
-    }
-
-    fn compare(self, a: &NameOffenderMetrics, b: &NameOffenderMetrics) -> Ordering {
-        let primary = match self {
-            Self::Current => b.current.partial_cmp(&a.current),
-            Self::Avg2m => b.avg.partial_cmp(&a.avg),
-            Self::Peak => b.peak.partial_cmp(&a.peak),
-        }
-        .unwrap_or(Ordering::Equal);
-
-        primary
-            .then_with(|| b.current.partial_cmp(&a.current).unwrap_or(Ordering::Equal))
-            .then_with(|| b.avg.partial_cmp(&a.avg).unwrap_or(Ordering::Equal))
-            .then_with(|| b.peak.partial_cmp(&a.peak).unwrap_or(Ordering::Equal))
-            .then_with(|| a.name.cmp(&b.name))
     }
 }
 
@@ -229,28 +220,19 @@ pub(crate) struct App {
     pub(crate) settings: AppSettings,
     pub(crate) settings_modal: Option<SettingsModalState>,
     pub(crate) pinned: Option<PinnedProcess>,
-    pub(crate) offender_pinned: Option<String>,
     pub(crate) process_selected: usize,
     pub(crate) process_scroll: usize,
     pub(crate) process_filter_query: String,
     pub(crate) process_filter_input: Option<String>,
-    pub(crate) offender_selected: usize,
-    pub(crate) offender_scroll: usize,
-    pub(crate) offender_filter_query: String,
-    pub(crate) offender_filter_input: Option<String>,
+    pub(crate) process_rows: Vec<ProcessTableRow>,
+    pub(crate) process_rows_dirty: bool,
+    pub(crate) process_sort: ProcessSort,
     pub(crate) power_history: VecDeque<f64>,
     pub(crate) live_snapshot_history: VecDeque<persistence::LiveSnapshot>,
     pub(crate) archive: persistence::ArchiveState,
-    pub(crate) process_visible_indices: Vec<usize>,
-    pub(crate) process_visible_dirty: bool,
-    pub(crate) offender_rows: Vec<NameOffenderMetrics>,
-    pub(crate) offender_visible_indices: Vec<usize>,
-    pub(crate) offender_visible_dirty: bool,
-    pub(crate) offender_sort: OffenderSort,
     pub(crate) graph_range: GraphRange,
     pub(crate) show_graph: bool,
     pub(crate) show_table: bool,
-    pub(crate) table_mode: TableMode,
     pub(crate) tick: u64,
     pub(crate) history_store: HistoryStore,
 }
@@ -265,36 +247,25 @@ impl App {
             settings: AppSettings::default(),
             settings_modal: None,
             pinned: None,
-            offender_pinned: None,
             process_selected: 0,
             process_scroll: 0,
             process_filter_query: String::new(),
             process_filter_input: None,
-            offender_selected: 0,
-            offender_scroll: 0,
-            offender_filter_query: String::new(),
-            offender_filter_input: None,
+            process_rows: Vec::new(),
+            process_rows_dirty: true,
+            process_sort: ProcessSort::Current,
             power_history: VecDeque::with_capacity(HISTORY_LIMIT),
             live_snapshot_history: VecDeque::with_capacity(HISTORY_LIMIT),
             archive: persistence::ArchiveState::default(),
-            process_visible_indices: Vec::new(),
-            process_visible_dirty: true,
-            offender_rows: Vec::new(),
-            offender_visible_indices: Vec::new(),
-            offender_visible_dirty: true,
-            offender_sort: OffenderSort::Current,
             graph_range: GraphRange::Minutes8,
             show_graph: true,
             show_table: true,
-            table_mode: TableMode::Processes,
             tick: 0,
             history_store: HistoryStore::new(HISTORY_LIMIT, HISTORY_STALE_TICKS),
         };
 
         let process_visible_len = app.process_visible_len();
         app.normalize_process_selection(process_visible_len);
-        let offender_visible_len = app.offender_visible_len();
-        app.normalize_offender_selection(offender_visible_len);
         app
     }
 
@@ -304,132 +275,59 @@ impl App {
             .unwrap_or(self.process_filter_query.as_str())
     }
 
-    pub(crate) fn offender_active_filter(&self) -> &str {
-        self.offender_filter_input
-            .as_deref()
-            .unwrap_or(self.offender_filter_query.as_str())
-    }
-
     pub(crate) fn is_filter_input_active(&self) -> bool {
-        match self.table_mode {
-            TableMode::Processes => self.process_filter_input.is_some(),
-            TableMode::Offenders => self.offender_filter_input.is_some(),
-        }
+        self.process_filter_input.is_some()
     }
 
-    pub(crate) fn mark_process_visible_dirty(&mut self) {
-        self.process_visible_dirty = true;
+    pub(crate) fn mark_process_rows_dirty(&mut self) {
+        self.process_rows_dirty = true;
     }
 
-    pub(crate) fn mark_offender_visible_dirty(&mut self) {
-        self.offender_visible_dirty = true;
-    }
-
-    pub(crate) fn rebuild_process_visible_if_needed(&mut self) {
-        if !self.process_visible_dirty {
+    pub(crate) fn rebuild_process_rows_if_needed(&mut self) {
+        if !self.process_rows_dirty {
             return;
         }
 
         let filter_lc = self.process_active_filter().trim().to_lowercase();
         let has_filter = !filter_lc.is_empty();
 
-        self.process_visible_indices.clear();
-        self.process_visible_indices.reserve(
-            self.snapshot
-                .rows
-                .len()
-                .saturating_sub(self.process_visible_indices.len()),
-        );
+        self.process_rows.clear();
+        self.process_rows.reserve(self.snapshot.rows.len());
 
-        for (idx, row) in self.snapshot.rows.iter().enumerate() {
+        for row in &self.snapshot.rows {
+            let key = PidKey::new(row.pid, row.process.clone());
+            let process_row = ProcessTableRow {
+                avg: self
+                    .history_store
+                    .pid_avg(&key, PROCESS_AVG_WINDOW_TICKS, self.tick),
+                peak: self
+                    .history_store
+                    .pid_peak(&key, PROCESS_PEAK_WINDOW_TICKS, self.tick),
+                current: row.power_num,
+                process_lc: row.process_lc.clone(),
+                key,
+            };
+
             let matches = if !has_filter {
                 true
             } else {
-                row.process_lc.contains(&filter_lc) || row.pid.to_string().contains(&filter_lc)
+                process_row.process_lc.contains(&filter_lc)
+                    || process_row.key.pid.to_string().contains(&filter_lc)
             };
 
             if matches {
-                self.process_visible_indices.push(idx);
+                self.process_rows.push(process_row);
             }
         }
 
-        self.process_visible_indices.sort_by(|a, b| {
-            let ra = &self.snapshot.rows[*a];
-            let rb = &self.snapshot.rows[*b];
-
-            rb.power_num
-                .partial_cmp(&ra.power_num)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| ra.process.cmp(&rb.process))
-        });
-
-        self.process_visible_dirty = false;
-    }
-
-    pub(crate) fn rebuild_offender_visible_if_needed(&mut self) {
-        if !self.offender_visible_dirty {
-            return;
-        }
-
-        self.offender_rows = self
-            .history_store
-            .top_name_offenders(
-                self.tick,
-                OFFENDER_AVG_WINDOW_TICKS,
-                OFFENDER_PEAK_WINDOW_TICKS,
-                usize::MAX,
-            )
-            .into_iter()
-            .filter(|offender| {
-                offender.current > GRAPH_ACTIVITY_EPSILON
-                    || offender.avg > GRAPH_ACTIVITY_EPSILON
-                    || offender.peak > GRAPH_ACTIVITY_EPSILON
-            })
-            .collect();
-
-        self.offender_rows
-            .sort_by(|a, b| self.offender_sort.compare(a, b));
-
-        let filter_lc = self.offender_active_filter().trim().to_lowercase();
-        let has_filter = !filter_lc.is_empty();
-
-        self.offender_visible_indices.clear();
-        self.offender_visible_indices.reserve(
-            self.offender_rows
-                .len()
-                .saturating_sub(self.offender_visible_indices.len()),
-        );
-
-        for (idx, offender) in self.offender_rows.iter().enumerate() {
-            let matches = if !has_filter {
-                true
-            } else {
-                offender.name.to_lowercase().contains(&filter_lc)
-            };
-
-            if matches {
-                self.offender_visible_indices.push(idx);
-            }
-        }
-
-        self.offender_visible_dirty = false;
+        self.process_rows
+            .sort_by(|a, b| self.process_sort.compare(a, b));
+        self.process_rows_dirty = false;
     }
 
     pub(crate) fn process_visible_len(&mut self) -> usize {
-        self.rebuild_process_visible_if_needed();
-        self.process_visible_indices.len()
-    }
-
-    pub(crate) fn offender_visible_len(&mut self) -> usize {
-        self.rebuild_offender_visible_if_needed();
-        self.offender_visible_indices.len()
-    }
-
-    fn visible_len(&mut self) -> usize {
-        match self.table_mode {
-            TableMode::Processes => self.process_visible_len(),
-            TableMode::Offenders => self.offender_visible_len(),
-        }
+        self.rebuild_process_rows_if_needed();
+        self.process_rows.len()
     }
 
     pub(crate) fn normalize_process_selection(&mut self, visible_len: usize) {
@@ -448,27 +346,30 @@ impl App {
         }
     }
 
-    pub(crate) fn normalize_offender_selection(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            self.offender_selected = 0;
-            self.offender_scroll = 0;
-            return;
-        }
-
-        if self.offender_selected >= visible_len {
-            self.offender_selected = visible_len - 1;
-        }
-
-        if self.offender_scroll > self.offender_selected {
-            self.offender_scroll = self.offender_selected;
-        }
+    pub(crate) fn selected_process_key(&mut self) -> Option<PidKey> {
+        self.rebuild_process_rows_if_needed();
+        self.process_rows
+            .get(self.process_selected)
+            .map(|row| row.key.clone())
     }
 
-    fn normalize_selection(&mut self, visible_len: usize) {
-        match self.table_mode {
-            TableMode::Processes => self.normalize_process_selection(visible_len),
-            TableMode::Offenders => self.normalize_offender_selection(visible_len),
+    fn restore_process_selection_by_key(&mut self, selected_key: Option<PidKey>) {
+        self.rebuild_process_rows_if_needed();
+
+        if let Some(key) = selected_key
+            && let Some(next_selected) = self.process_rows.iter().position(|row| row.key == key)
+        {
+            self.process_selected = next_selected;
         }
+
+        self.normalize_process_selection(self.process_rows.len());
+    }
+
+    pub(crate) fn cycle_process_sort(&mut self) {
+        let selected_key = self.selected_process_key();
+        self.process_sort = self.process_sort.next();
+        self.mark_process_rows_dirty();
+        self.restore_process_selection_by_key(selected_key);
     }
 
     pub(crate) fn record_history(&mut self) {
@@ -479,17 +380,16 @@ impl App {
             let _ = self.power_history.pop_front();
         }
 
-        let mut live_samples = Vec::with_capacity(self.snapshot.rows.len());
-        let mut grouped_totals: HashMap<String, f64> = HashMap::new();
-
-        for row in &self.snapshot.rows {
-            live_samples.push(persistence::LiveProcessSample {
+        let live_samples: Vec<persistence::LiveProcessSample> = self
+            .snapshot
+            .rows
+            .iter()
+            .map(|row| persistence::LiveProcessSample {
                 pid: row.pid,
                 process: row.process.clone(),
                 power: row.power_num,
-            });
-            *grouped_totals.entry(row.process.clone()).or_insert(0.0) += row.power_num;
-        }
+            })
+            .collect();
 
         self.history_store.update(
             self.tick,
@@ -503,7 +403,7 @@ impl App {
         self.live_snapshot_history
             .push_back(persistence::LiveSnapshot {
                 tick: self.tick,
-                samples: live_samples,
+                samples: live_samples.clone(),
             });
         while self.live_snapshot_history.len() > HISTORY_LIMIT {
             let _ = self.live_snapshot_history.pop_front();
@@ -513,7 +413,7 @@ impl App {
             persistence::unix_time_secs_now(),
             persistence::continuity_threshold_secs(REFRESH_EVERY),
             self.snapshot.total_power,
-            grouped_totals.into_iter(),
+            live_samples,
         );
     }
 
@@ -575,12 +475,9 @@ impl App {
             self.snapshot = snapshot_from_live_snapshot(last_snapshot);
             self.loading = false;
             self.last_error = None;
-            self.mark_process_visible_dirty();
-            self.mark_offender_visible_dirty();
+            self.mark_process_rows_dirty();
             let process_visible_len = self.process_visible_len();
             self.normalize_process_selection(process_visible_len);
-            let offender_visible_len = self.offender_visible_len();
-            self.normalize_offender_selection(offender_visible_len);
         }
     }
 
@@ -602,17 +499,17 @@ impl App {
         history_viewport_samples_deque(&self.power_history, graph_width)
     }
 
-    pub(crate) fn offender_archive_samples_for_width(
+    pub(crate) fn pid_archive_samples_for_width(
         &self,
-        name: &str,
+        key: &PidKey,
         graph_width: usize,
     ) -> Option<Vec<Option<f64>>> {
         let archive_range = self.graph_range.archive_range()?;
-        Some(archive_query::group_graph_samples_for_range(
+        Some(archive_query::pid_graph_samples_for_range(
             &self.archive,
             archive_range,
             graph_width,
-            name,
+            key,
         ))
     }
 
@@ -621,66 +518,29 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.visible_len();
+        let len = self.process_visible_len();
         if len == 0 {
-            match self.table_mode {
-                TableMode::Processes => {
-                    self.process_selected = 0;
-                    self.process_scroll = 0;
-                }
-                TableMode::Offenders => {
-                    self.offender_selected = 0;
-                    self.offender_scroll = 0;
-                }
-            }
+            self.process_selected = 0;
+            self.process_scroll = 0;
             return;
         }
 
-        let current = match self.table_mode {
-            TableMode::Processes => self.process_selected,
-            TableMode::Offenders => self.offender_selected,
-        };
         let max = (len - 1) as isize;
-        let next = (current as isize + delta).clamp(0, max) as usize;
-
-        match self.table_mode {
-            TableMode::Processes => self.process_selected = next,
-            TableMode::Offenders => self.offender_selected = next,
-        }
+        self.process_selected = (self.process_selected as isize + delta).clamp(0, max) as usize;
     }
 
     fn select_top(&mut self) {
-        match self.table_mode {
-            TableMode::Processes => {
-                self.process_selected = 0;
-                self.process_scroll = 0;
-            }
-            TableMode::Offenders => {
-                self.offender_selected = 0;
-                self.offender_scroll = 0;
-            }
-        }
+        self.process_selected = 0;
+        self.process_scroll = 0;
     }
 
     fn select_bottom(&mut self) {
-        let len = self.visible_len();
-        match self.table_mode {
-            TableMode::Processes => {
-                if len == 0 {
-                    self.process_selected = 0;
-                    self.process_scroll = 0;
-                } else {
-                    self.process_selected = len - 1;
-                }
-            }
-            TableMode::Offenders => {
-                if len == 0 {
-                    self.offender_selected = 0;
-                    self.offender_scroll = 0;
-                } else {
-                    self.offender_selected = len - 1;
-                }
-            }
+        let len = self.process_visible_len();
+        if len == 0 {
+            self.process_selected = 0;
+            self.process_scroll = 0;
+        } else {
+            self.process_selected = len - 1;
         }
     }
 
@@ -688,97 +548,25 @@ impl App {
         self.paused = !self.paused;
     }
 
-    fn is_process_table_mode(&self) -> bool {
-        self.table_mode == TableMode::Processes
-    }
-
-    fn toggle_table_mode(&mut self) {
-        self.table_mode = match self.table_mode {
-            TableMode::Processes => TableMode::Offenders,
-            TableMode::Offenders => TableMode::Processes,
-        };
-    }
-
-    pub(crate) fn selected_offender_name(&mut self) -> Option<String> {
-        self.rebuild_offender_visible_if_needed();
-        let idx = self
-            .offender_visible_indices
-            .get(self.offender_selected)
-            .copied()?;
-        self.offender_rows
-            .get(idx)
-            .map(|offender| offender.name.clone())
-    }
-
-    fn restore_offender_selection_by_name(&mut self, selected_name: Option<String>) {
-        self.rebuild_offender_visible_if_needed();
-
-        if let Some(name) = selected_name {
-            if let Some(next_selected) = self
-                .offender_visible_indices
-                .iter()
-                .position(|idx| self.offender_rows[*idx].name == name)
-            {
-                self.offender_selected = next_selected;
-            }
-        }
-
-        self.normalize_offender_selection(self.offender_visible_indices.len());
-    }
-
-    pub(crate) fn cycle_offender_sort(&mut self) {
-        let selected_name = self.selected_offender_name();
-        self.offender_sort = self.offender_sort.next();
-        self.mark_offender_visible_dirty();
-        self.restore_offender_selection_by_name(selected_name);
-    }
-
     pub(crate) fn is_pinned(&self) -> bool {
-        self.is_process_table_mode() && self.pinned.is_some()
-    }
-
-    pub(crate) fn is_offender_pinned(&self) -> bool {
-        self.table_mode == TableMode::Offenders && self.offender_pinned.is_some()
+        self.pinned.is_some()
     }
 
     fn toggle_pin(&mut self) {
-        if !self.is_process_table_mode() {
-            return;
-        }
-
         if self.pinned.is_some() {
             self.pinned = None;
             return;
         }
 
-        self.rebuild_process_visible_if_needed();
-        let Some(snapshot_idx) = self
-            .process_visible_indices
-            .get(self.process_selected)
-            .copied()
-        else {
+        self.rebuild_process_rows_if_needed();
+        let Some(row) = self.process_rows.get(self.process_selected) else {
             return;
         };
 
-        if let Some(row) = self.snapshot.rows.get(snapshot_idx) {
-            self.pinned = Some(PinnedProcess {
-                pid: row.pid,
-                process: row.process.clone(),
-            });
-        }
-    }
-
-    fn toggle_offender_pin(&mut self) {
-        if self.table_mode != TableMode::Offenders {
-            return;
-        }
-
-        if self.offender_pinned.is_some() {
-            self.offender_pinned = None;
-            return;
-        }
-
-        self.offender_pinned = self.selected_offender_name();
+        self.pinned = Some(PinnedProcess {
+            pid: row.key.pid,
+            process: row.key.process.clone(),
+        });
     }
 
     fn open_settings_modal(&mut self) {
@@ -831,9 +619,7 @@ impl App {
             }
         } else {
             match key.code {
-                KeyCode::Esc => {
-                    close_modal = true;
-                }
+                KeyCode::Esc => close_modal = true,
                 KeyCode::Char('m') | KeyCode::Char('M') => {
                     match modal.draft.graph_heat.validate() {
                         Ok(()) => {
@@ -853,9 +639,7 @@ impl App {
                     modal.move_selection(-1);
                     modal.error = None;
                 }
-                KeyCode::Enter => {
-                    modal.start_edit();
-                }
+                KeyCode::Enter => modal.start_edit(),
                 _ => {}
             }
         }
@@ -870,122 +654,63 @@ impl App {
     }
 
     fn start_filter_input(&mut self) {
-        match self.table_mode {
-            TableMode::Processes => {
-                self.process_filter_input = Some(self.process_filter_query.clone());
-                self.mark_process_visible_dirty();
-            }
-            TableMode::Offenders => {
-                self.offender_filter_input = Some(self.offender_filter_query.clone());
-                self.mark_offender_visible_dirty();
-            }
-        }
+        self.process_filter_input = Some(self.process_filter_query.clone());
+        self.mark_process_rows_dirty();
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
-        match self.table_mode {
-            TableMode::Processes => {
-                let Some(buf) = self.process_filter_input.as_mut() else {
-                    return;
-                };
+        let Some(buf) = self.process_filter_input.as_mut() else {
+            return;
+        };
 
-                let mut touched_filter = false;
+        let mut touched_filter = false;
 
-                match key.code {
-                    KeyCode::Esc => {
-                        self.process_filter_input = None;
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Enter => {
-                        self.process_filter_query = buf.clone();
-                        self.process_filter_input = None;
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Char(ch) => {
-                        buf.push(ch);
-                        self.process_selected = 0;
-                        self.process_scroll = 0;
-                        touched_filter = true;
-                    }
-                    _ => {}
-                }
-
-                if touched_filter {
-                    self.mark_process_visible_dirty();
-                }
-
-                let visible_len = self.process_visible_len();
-                self.normalize_process_selection(visible_len);
+        match key.code {
+            KeyCode::Esc => {
+                self.process_filter_input = None;
+                self.process_selected = 0;
+                self.process_scroll = 0;
+                touched_filter = true;
             }
-            TableMode::Offenders => {
-                let Some(buf) = self.offender_filter_input.as_mut() else {
-                    return;
-                };
-
-                let mut touched_filter = false;
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.offender_filter_input = None;
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Enter => {
-                        self.offender_filter_query = buf.clone();
-                        self.offender_filter_input = None;
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    KeyCode::Char(ch) => {
-                        buf.push(ch);
-                        self.offender_selected = 0;
-                        self.offender_scroll = 0;
-                        touched_filter = true;
-                    }
-                    _ => {}
-                }
-
-                if touched_filter {
-                    self.mark_offender_visible_dirty();
-                }
-
-                let visible_len = self.offender_visible_len();
-                self.normalize_offender_selection(visible_len);
+            KeyCode::Enter => {
+                self.process_filter_query = buf.clone();
+                self.process_filter_input = None;
+                self.process_selected = 0;
+                self.process_scroll = 0;
+                touched_filter = true;
             }
+            KeyCode::Backspace => {
+                buf.pop();
+                self.process_selected = 0;
+                self.process_scroll = 0;
+                touched_filter = true;
+            }
+            KeyCode::Char(ch) => {
+                buf.push(ch);
+                self.process_selected = 0;
+                self.process_scroll = 0;
+                touched_filter = true;
+            }
+            _ => {}
         }
+
+        if touched_filter {
+            self.mark_process_rows_dirty();
+        }
+
+        let visible_len = self.process_visible_len();
+        self.normalize_process_selection(visible_len);
     }
 
     pub(crate) fn apply_snapshot(&mut self, next: Snapshot) {
-        let selected_offender_name = self.selected_offender_name();
+        let selected_key = self.selected_process_key();
 
         self.snapshot = next;
         self.last_error = None;
         self.loading = false;
-        self.mark_process_visible_dirty();
-        self.mark_offender_visible_dirty();
         self.record_history();
-
-        let process_visible_len = self.process_visible_len();
-        self.normalize_process_selection(process_visible_len);
-        self.restore_offender_selection_by_name(selected_offender_name);
+        self.mark_process_rows_dirty();
+        self.restore_process_selection_by_key(selected_key);
     }
 
     fn apply_refresh_error(&mut self, err: String) {
@@ -997,34 +722,6 @@ impl App {
         match event {
             CollectorEvent::Snapshot(next) => self.apply_snapshot(next),
             CollectorEvent::Error(err) => self.apply_refresh_error(err),
-        }
-    }
-
-    pub(crate) fn status_hint_text(&self) -> &'static str {
-        if self.settings_modal.is_some() {
-            "Enter edit • Esc cancel"
-        } else if self.is_filter_input_active() {
-            "Enter apply • Esc cancel"
-        } else if self.table_mode == TableMode::Offenders {
-            if self.offender_pinned.is_some() {
-                "Enter unpin • 4 range"
-            } else {
-                "Enter pin • s sort"
-            }
-        } else if self.pinned.is_some() {
-            "Enter unpin"
-        } else {
-            "Enter pin"
-        }
-    }
-
-    pub(crate) fn status_hint_chips(&self) -> Vec<(&'static str, char)> {
-        if self.settings_modal.is_some() {
-            vec![("menu", 'm')]
-        } else if self.is_filter_input_active() {
-            vec![]
-        } else {
-            vec![("menu", 'm'), ("filter /", '/'), ("quit", 'q')]
         }
     }
 
@@ -1043,10 +740,7 @@ impl App {
             return false;
         }
 
-        let can_navigate = match self.table_mode {
-            TableMode::Processes => !self.is_pinned(),
-            TableMode::Offenders => !self.is_offender_pinned(),
-        };
+        let can_navigate = !self.is_pinned();
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
@@ -1054,25 +748,19 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if can_navigate => self.move_selection(-1),
             KeyCode::Char('g') if can_navigate => self.select_top(),
             KeyCode::Char('G') if can_navigate => self.select_bottom(),
-            KeyCode::Char('/') => self.start_filter_input(),
+            KeyCode::Char('f') | KeyCode::Char('F') if self.show_table => self.start_filter_input(),
             KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_pause(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_settings_modal(),
             KeyCode::Char('1') => self.show_graph = !self.show_graph,
             KeyCode::Char('2') => self.show_table = !self.show_table,
-            KeyCode::Char('3') => self.toggle_table_mode(),
-            KeyCode::Char('4') => self.cycle_graph_range(),
-            KeyCode::Char('s') | KeyCode::Char('S') if self.table_mode == TableMode::Offenders => {
-                self.cycle_offender_sort();
-            }
-            KeyCode::Enter => match self.table_mode {
-                TableMode::Processes => self.toggle_pin(),
-                TableMode::Offenders => self.toggle_offender_pin(),
-            },
+            KeyCode::Char('r') | KeyCode::Char('R') => self.cycle_graph_range(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.cycle_process_sort(),
+            KeyCode::Enter => self.toggle_pin(),
             _ => {}
         }
 
-        let visible_len = self.visible_len();
-        self.normalize_selection(visible_len);
+        let visible_len = self.process_visible_len();
+        self.normalize_process_selection(visible_len);
         false
     }
 }

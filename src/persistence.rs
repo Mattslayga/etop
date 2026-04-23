@@ -9,15 +9,17 @@ use std::{
 
 const CACHE_MAGIC: &[u8; 8] = b"ETOPCACH";
 const CACHE_VERSION_V2: u16 = 2;
-const CACHE_VERSION: u16 = 3;
+const CACHE_VERSION_V3: u16 = 3;
+const CACHE_VERSION: u16 = 4;
 const CACHE_FILE_NAME: &str = "session-cache.v1.bin";
 const QUICK_HYDRATE_GAP_MULTIPLIER: u64 = 3;
+const LEGACY_ARCHIVE_PID: i32 = -1;
 
 const MAX_LIVE_POWER_POINTS: usize = 16_384;
 const MAX_LIVE_SNAPSHOTS: usize = 16_384;
 const MAX_SNAPSHOT_ROWS: usize = 65_536;
 const MAX_TIER_SAMPLES: usize = 16_384;
-const MAX_GROUPS_PER_SAMPLE: usize = 65_536;
+const MAX_PROCESSES_PER_SAMPLE: usize = 65_536;
 const MAX_STRING_BYTES: usize = 4_096;
 const MAX_REASONABLE_PERSISTED_POWER: f64 = 10_000.0;
 
@@ -42,8 +44,9 @@ pub struct LiveSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GroupPowerSum {
-    pub name: String,
+pub struct ArchivedProcessPower {
+    pub pid: i32,
+    pub process: String,
     pub power_sum: f64,
 }
 
@@ -52,7 +55,7 @@ pub struct TierSample {
     pub bucket_start_secs: u64,
     pub sample_count: u32,
     pub total_power_sum: f64,
-    pub groups: Vec<GroupPowerSum>,
+    pub processes: Vec<ArchivedProcessPower>,
     pub gap_before: bool,
 }
 
@@ -60,14 +63,14 @@ impl TierSample {
     fn from_single_sample(
         bucket_start_secs: u64,
         total_power: f64,
-        groups: &[GroupPowerSum],
+        processes: &[ArchivedProcessPower],
         gap_before: bool,
     ) -> Self {
         Self {
             bucket_start_secs,
             sample_count: 1,
             total_power_sum: total_power,
-            groups: groups.to_vec(),
+            processes: processes.to_vec(),
             gap_before,
         }
     }
@@ -87,11 +90,11 @@ impl ArchiveState {
         timestamp_secs: u64,
         max_contiguous_gap_secs: u64,
         total_power: f64,
-        grouped: I,
+        processes: I,
     ) where
-        I: IntoIterator<Item = (String, f64)>,
+        I: IntoIterator<Item = LiveProcessSample>,
     {
-        let groups = normalize_group_sums(grouped);
+        let processes = normalize_process_sums(processes);
         let has_gap_from_previous = self
             .last_sample_unix_secs
             .map(|previous| timestamp_secs.saturating_sub(previous) > max_contiguous_gap_secs)
@@ -103,7 +106,7 @@ impl ArchiveState {
             RAW_2S_CAPACITY,
             timestamp_secs,
             total_power,
-            &groups,
+            &processes,
             has_gap_from_previous,
         );
 
@@ -113,7 +116,7 @@ impl ArchiveState {
             AGG_10S_CAPACITY,
             timestamp_secs,
             total_power,
-            &groups,
+            &processes,
             has_gap_from_previous,
         );
 
@@ -123,7 +126,7 @@ impl ArchiveState {
             AGG_60S_CAPACITY,
             timestamp_secs,
             total_power,
-            &groups,
+            &processes,
             has_gap_from_previous,
         );
 
@@ -341,47 +344,57 @@ fn sanitize_tier_power(tier: &mut VecDeque<TierSample>, max_reasonable_power: f6
         }
 
         sample.total_power_sum = avg_power * f64::from(sample.sample_count);
-        sample.groups.retain(|group| {
-            let avg_group_power = group.power_sum / f64::from(sample.sample_count);
-            is_reasonable_power(avg_group_power, max_reasonable_power)
+        sample.processes.retain(|process| {
+            let avg_process_power = process.power_sum / f64::from(sample.sample_count);
+            is_reasonable_power(avg_process_power, max_reasonable_power)
         });
         true
     });
 }
 
-fn normalize_group_sums<I>(grouped: I) -> Vec<GroupPowerSum>
+fn normalize_process_sums<I>(processes: I) -> Vec<ArchivedProcessPower>
 where
-    I: IntoIterator<Item = (String, f64)>,
+    I: IntoIterator<Item = LiveProcessSample>,
 {
-    let mut sums: HashMap<String, f64> = HashMap::new();
+    let mut sums: HashMap<(i32, String), f64> = HashMap::new();
 
-    for (name, power) in grouped {
-        *sums.entry(name).or_insert(0.0) += power;
+    for process in processes {
+        *sums.entry((process.pid, process.process)).or_insert(0.0) += process.power;
     }
 
-    let mut pairs: Vec<GroupPowerSum> = sums
+    let mut normalized: Vec<ArchivedProcessPower> = sums
         .into_iter()
-        .map(|(name, power_sum)| GroupPowerSum { name, power_sum })
+        .map(|((pid, process), power_sum)| ArchivedProcessPower {
+            pid,
+            process,
+            power_sum,
+        })
         .collect();
-    pairs.sort_by(|a, b| a.name.cmp(&b.name));
-    pairs
+    normalized.sort_by(|a, b| a.process.cmp(&b.process).then_with(|| a.pid.cmp(&b.pid)));
+    normalized
 }
 
-fn merge_group_sums(existing: &mut Vec<GroupPowerSum>, incoming: &[GroupPowerSum]) {
-    let mut sums: HashMap<String, f64> = existing
+fn merge_process_sums(existing: &mut Vec<ArchivedProcessPower>, incoming: &[ArchivedProcessPower]) {
+    let mut sums: HashMap<(i32, String), f64> = existing
         .iter()
-        .map(|entry| (entry.name.clone(), entry.power_sum))
+        .map(|entry| ((entry.pid, entry.process.clone()), entry.power_sum))
         .collect();
 
     for entry in incoming {
-        *sums.entry(entry.name.clone()).or_insert(0.0) += entry.power_sum;
+        *sums
+            .entry((entry.pid, entry.process.clone()))
+            .or_insert(0.0) += entry.power_sum;
     }
 
-    let mut merged: Vec<GroupPowerSum> = sums
+    let mut merged: Vec<ArchivedProcessPower> = sums
         .into_iter()
-        .map(|(name, power_sum)| GroupPowerSum { name, power_sum })
+        .map(|((pid, process), power_sum)| ArchivedProcessPower {
+            pid,
+            process,
+            power_sum,
+        })
         .collect();
-    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    merged.sort_by(|a, b| a.process.cmp(&b.process).then_with(|| a.pid.cmp(&b.pid)));
     *existing = merged;
 }
 
@@ -391,7 +404,7 @@ fn upsert_aggregate_bucket(
     capacity: usize,
     timestamp_secs: u64,
     total_power: f64,
-    groups: &[GroupPowerSum],
+    processes: &[ArchivedProcessPower],
     has_gap_from_previous: bool,
 ) {
     // A long downtime may produce a new sample that lands in the same wall-clock bucket
@@ -409,7 +422,7 @@ fn upsert_aggregate_bucket(
             if last.bucket_start_secs == bucket_start {
                 last.sample_count = last.sample_count.saturating_add(1);
                 last.total_power_sum += total_power;
-                merge_group_sums(&mut last.groups, groups);
+                merge_process_sums(&mut last.processes, processes);
                 return;
             }
         }
@@ -419,7 +432,7 @@ fn upsert_aggregate_bucket(
     tier.push_back(TierSample::from_single_sample(
         bucket_start,
         total_power,
-        groups,
+        processes,
         gap_before,
     ));
     trim_to_capacity(tier, capacity);
@@ -479,10 +492,11 @@ fn encode_tier<W: Write>(writer: &mut W, tier: &VecDeque<TierSample>) -> io::Res
         write_u32(writer, sample.sample_count)?;
         write_f64(writer, sample.total_power_sum)?;
 
-        write_len(writer, sample.groups.len())?;
-        for group in &sample.groups {
-            write_string(writer, &group.name)?;
-            write_f64(writer, group.power_sum)?;
+        write_len(writer, sample.processes.len())?;
+        for process in &sample.processes {
+            write_i32(writer, process.pid)?;
+            write_string(writer, &process.process)?;
+            write_f64(writer, process.power_sum)?;
         }
         write_bool(writer, sample.gap_before)?;
     }
@@ -501,7 +515,7 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     }
 
     let version = read_u16(reader)?;
-    if version != CACHE_VERSION_V2 && version != CACHE_VERSION {
+    if version != CACHE_VERSION_V2 && version != CACHE_VERSION_V3 && version != CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported cache version: {version}"),
@@ -565,16 +579,31 @@ fn decode_tier<R: Read>(reader: &mut R, version: u16) -> io::Result<VecDeque<Tie
         let sample_count = read_u32(reader)?;
         let total_power_sum = read_f64(reader)?;
 
-        let groups_len = read_len(reader, MAX_GROUPS_PER_SAMPLE, "grouped samples")?;
-        let mut groups = Vec::with_capacity(groups_len);
-        for _ in 0..groups_len {
-            groups.push(GroupPowerSum {
-                name: read_string(reader, MAX_STRING_BYTES)?,
-                power_sum: read_f64(reader)?,
-            });
+        let processes_len = read_len(reader, MAX_PROCESSES_PER_SAMPLE, "archived process samples")?;
+        let mut processes = Vec::with_capacity(processes_len);
+        match version {
+            CACHE_VERSION => {
+                for _ in 0..processes_len {
+                    processes.push(ArchivedProcessPower {
+                        pid: read_i32(reader)?,
+                        process: read_string(reader, MAX_STRING_BYTES)?,
+                        power_sum: read_f64(reader)?,
+                    });
+                }
+            }
+            CACHE_VERSION_V2 | CACHE_VERSION_V3 => {
+                for _ in 0..processes_len {
+                    processes.push(ArchivedProcessPower {
+                        pid: LEGACY_ARCHIVE_PID,
+                        process: read_string(reader, MAX_STRING_BYTES)?,
+                        power_sum: read_f64(reader)?,
+                    });
+                }
+            }
+            _ => unreachable!(),
         }
 
-        let gap_before = if version == CACHE_VERSION {
+        let gap_before = if version >= CACHE_VERSION_V3 {
             read_bool(reader)?
         } else {
             false
@@ -584,7 +613,7 @@ fn decode_tier<R: Read>(reader: &mut R, version: u16) -> io::Result<VecDeque<Tie
             bucket_start_secs,
             sample_count,
             total_power_sum,
-            groups,
+            processes,
             gap_before,
         });
     }
@@ -696,8 +725,21 @@ mod tests {
     use super::*;
 
     fn encode_session_cache_v2<W: Write>(cache: &SessionCache, writer: &mut W) -> io::Result<()> {
+        encode_legacy_session_cache(cache, writer, CACHE_VERSION_V2, false)
+    }
+
+    fn encode_session_cache_v3<W: Write>(cache: &SessionCache, writer: &mut W) -> io::Result<()> {
+        encode_legacy_session_cache(cache, writer, CACHE_VERSION_V3, true)
+    }
+
+    fn encode_legacy_session_cache<W: Write>(
+        cache: &SessionCache,
+        writer: &mut W,
+        version: u16,
+        include_gap_before: bool,
+    ) -> io::Result<()> {
         writer.write_all(CACHE_MAGIC)?;
-        write_u16(writer, CACHE_VERSION_V2)?;
+        write_u16(writer, version)?;
         write_u64(writer, cache.saved_at_unix_millis)?;
         write_u64(writer, cache.last_tick)?;
         write_u64(writer, cache.archive.last_sample_unix_secs.unwrap_or(0))?;
@@ -719,14 +761,18 @@ mod tests {
             }
         }
 
-        encode_tier_v2(writer, &cache.archive.raw_2s)?;
-        encode_tier_v2(writer, &cache.archive.agg_10s)?;
-        encode_tier_v2(writer, &cache.archive.agg_60s)?;
+        encode_legacy_tier(writer, &cache.archive.raw_2s, include_gap_before)?;
+        encode_legacy_tier(writer, &cache.archive.agg_10s, include_gap_before)?;
+        encode_legacy_tier(writer, &cache.archive.agg_60s, include_gap_before)?;
 
         Ok(())
     }
 
-    fn encode_tier_v2<W: Write>(writer: &mut W, tier: &VecDeque<TierSample>) -> io::Result<()> {
+    fn encode_legacy_tier<W: Write>(
+        writer: &mut W,
+        tier: &VecDeque<TierSample>,
+        include_gap_before: bool,
+    ) -> io::Result<()> {
         write_len(writer, tier.len())?;
 
         for sample in tier {
@@ -734,10 +780,13 @@ mod tests {
             write_u32(writer, sample.sample_count)?;
             write_f64(writer, sample.total_power_sum)?;
 
-            write_len(writer, sample.groups.len())?;
-            for group in &sample.groups {
-                write_string(writer, &group.name)?;
-                write_f64(writer, group.power_sum)?;
+            write_len(writer, sample.processes.len())?;
+            for process in &sample.processes {
+                write_string(writer, &process.process)?;
+                write_f64(writer, process.power_sum)?;
+            }
+            if include_gap_before {
+                write_bool(writer, sample.gap_before)?;
             }
         }
 
@@ -751,13 +800,35 @@ mod tests {
             100,
             6,
             10.0,
-            [("Safari".to_string(), 6.0), ("Mail".to_string(), 4.0)],
+            [
+                LiveProcessSample {
+                    pid: 1,
+                    process: "Safari".to_string(),
+                    power: 6.0,
+                },
+                LiveProcessSample {
+                    pid: 2,
+                    process: "Mail".to_string(),
+                    power: 4.0,
+                },
+            ],
         );
         archive.record_sample(
             102,
             6,
             8.0,
-            [("Safari".to_string(), 5.0), ("Slack".to_string(), 3.0)],
+            [
+                LiveProcessSample {
+                    pid: 1,
+                    process: "Safari".to_string(),
+                    power: 5.0,
+                },
+                LiveProcessSample {
+                    pid: 3,
+                    process: "Slack".to_string(),
+                    power: 3.0,
+                },
+            ],
         );
 
         let cache = SessionCache {
@@ -819,8 +890,9 @@ mod tests {
                         bucket_start_secs: 100,
                         sample_count: 1,
                         total_power_sum: 10.0,
-                        groups: vec![GroupPowerSum {
-                            name: "Safari".to_string(),
+                        processes: vec![ArchivedProcessPower {
+                            pid: 1,
+                            process: "Safari".to_string(),
                             power_sum: 10.0,
                         }],
                         gap_before: false,
@@ -829,8 +901,9 @@ mod tests {
                         bucket_start_secs: 108,
                         sample_count: 1,
                         total_power_sum: 12.0,
-                        groups: vec![GroupPowerSum {
-                            name: "Safari".to_string(),
+                        processes: vec![ArchivedProcessPower {
+                            pid: 1,
+                            process: "Safari".to_string(),
                             power_sum: 12.0,
                         }],
                         gap_before: false,
@@ -845,7 +918,79 @@ mod tests {
         encode_session_cache_v2(&cache, &mut bytes).expect("v2 encode should succeed");
 
         let decoded = decode_session_cache(&mut bytes.as_slice()).expect("decode should succeed");
-        assert_eq!(decoded, cache);
+        assert_eq!(decoded.saved_at_unix_millis, cache.saved_at_unix_millis);
+        assert_eq!(decoded.last_tick, cache.last_tick);
+        assert_eq!(decoded.live_power_history, cache.live_power_history);
+        assert_eq!(decoded.live_snapshots, cache.live_snapshots);
+        assert_eq!(
+            decoded.archive.last_sample_unix_secs,
+            cache.archive.last_sample_unix_secs
+        );
+        assert_eq!(decoded.archive.raw_2s.len(), 2);
+        assert_eq!(
+            decoded.archive.raw_2s[0].processes[0].pid,
+            LEGACY_ARCHIVE_PID
+        );
+        assert_eq!(decoded.archive.raw_2s[0].processes[0].process, "Safari");
+        assert!(!decoded.archive.raw_2s[1].gap_before);
+    }
+
+    #[test]
+    fn session_cache_decodes_v3_binary_format_with_legacy_name_entries() {
+        let cache = SessionCache {
+            saved_at_unix_millis: 222_333,
+            last_tick: 77,
+            live_power_history: vec![1.0, 2.0],
+            live_snapshots: vec![LiveSnapshot {
+                tick: 77,
+                samples: vec![LiveProcessSample {
+                    pid: 9,
+                    process: "Mail".to_string(),
+                    power: 2.0,
+                }],
+            }],
+            archive: ArchiveState {
+                agg_10s: VecDeque::from(vec![
+                    TierSample {
+                        bucket_start_secs: 100,
+                        sample_count: 1,
+                        total_power_sum: 9.0,
+                        processes: vec![ArchivedProcessPower {
+                            pid: 10,
+                            process: "Safari".to_string(),
+                            power_sum: 9.0,
+                        }],
+                        gap_before: false,
+                    },
+                    TierSample {
+                        bucket_start_secs: 110,
+                        sample_count: 1,
+                        total_power_sum: 12.0,
+                        processes: vec![ArchivedProcessPower {
+                            pid: 10,
+                            process: "Safari".to_string(),
+                            power_sum: 12.0,
+                        }],
+                        gap_before: true,
+                    },
+                ]),
+                last_sample_unix_secs: Some(110),
+                ..ArchiveState::default()
+            },
+        };
+
+        let mut bytes = Vec::new();
+        encode_session_cache_v3(&cache, &mut bytes).expect("v3 encode should succeed");
+
+        let decoded = decode_session_cache(&mut bytes.as_slice()).expect("decode should succeed");
+        assert_eq!(decoded.archive.agg_10s.len(), 2);
+        assert_eq!(
+            decoded.archive.agg_10s[0].processes[0].pid,
+            LEGACY_ARCHIVE_PID
+        );
+        assert_eq!(decoded.archive.agg_10s[0].processes[0].process, "Safari");
+        assert!(!decoded.archive.agg_10s[0].gap_before);
+        assert!(decoded.archive.agg_10s[1].gap_before);
     }
 
     #[test]
@@ -857,7 +1002,11 @@ mod tests {
                 idx * 2,
                 6,
                 (idx % 100) as f64,
-                [("Safari".to_string(), (idx % 10) as f64)],
+                [LiveProcessSample {
+                    pid: 10,
+                    process: "Safari".to_string(),
+                    power: (idx % 10) as f64,
+                }],
             );
         }
 
@@ -896,8 +1045,26 @@ mod tests {
         let mut archive = ArchiveState::default();
         let threshold = continuity_threshold_secs(Duration::from_secs(2));
 
-        archive.record_sample(100, threshold, 10.0, [("Safari".to_string(), 10.0)]);
-        archive.record_sample(108, threshold, 12.0, [("Safari".to_string(), 12.0)]);
+        archive.record_sample(
+            100,
+            threshold,
+            10.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 10.0,
+            }],
+        );
+        archive.record_sample(
+            108,
+            threshold,
+            12.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 12.0,
+            }],
+        );
 
         assert_eq!(archive.agg_10s.len(), 2);
         assert_eq!(archive.agg_10s[0].bucket_start_secs, 100);
@@ -913,8 +1080,26 @@ mod tests {
         let mut archive = ArchiveState::default();
         let threshold = continuity_threshold_secs(Duration::from_secs(2));
 
-        archive.record_sample(124, threshold, 10.0, [("Safari".to_string(), 10.0)]);
-        archive.record_sample(136, threshold, 12.0, [("Safari".to_string(), 12.0)]);
+        archive.record_sample(
+            124,
+            threshold,
+            10.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 10.0,
+            }],
+        );
+        archive.record_sample(
+            136,
+            threshold,
+            12.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 12.0,
+            }],
+        );
 
         assert_eq!(archive.agg_60s.len(), 2);
         assert_eq!(archive.agg_60s[0].bucket_start_secs, 120);
@@ -930,8 +1115,26 @@ mod tests {
         let mut archive = ArchiveState::default();
         let threshold = continuity_threshold_secs(Duration::from_secs(2));
 
-        archive.record_sample(100, threshold, 10.0, [("Safari".to_string(), 10.0)]);
-        archive.record_sample(115, threshold, 12.0, [("Safari".to_string(), 12.0)]);
+        archive.record_sample(
+            100,
+            threshold,
+            10.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 10.0,
+            }],
+        );
+        archive.record_sample(
+            115,
+            threshold,
+            12.0,
+            [LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 12.0,
+            }],
+        );
 
         assert_eq!(archive.agg_10s.len(), 2);
         assert_eq!(archive.agg_10s[0].bucket_start_secs, 100);
@@ -977,14 +1180,14 @@ mod tests {
                         bucket_start_secs: 100,
                         sample_count: 1,
                         total_power_sum: 10.0,
-                        groups: Vec::new(),
+                        processes: Vec::new(),
                         gap_before: false,
                     },
                     TierSample {
                         bucket_start_secs: 102,
                         sample_count: 1,
                         total_power_sum: 55_443_352.6,
-                        groups: Vec::new(),
+                        processes: Vec::new(),
                         gap_before: false,
                     },
                 ]),

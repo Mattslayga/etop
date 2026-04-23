@@ -15,18 +15,16 @@ mod history;
 mod persistence;
 mod top_parse;
 
-use app_state::{
-    App, GraphHeatSettings, OffenderSort, SETTINGS_FIELDS, SettingsModalState, TableMode,
-};
+use app_state::{App, GraphHeatSettings, SETTINGS_FIELDS, SettingsModalState};
 use crossterm::event::{self, Event};
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent};
 #[cfg(test)]
 use graph::GraphRange;
 use graph::{
-    GRAPH_ACTIVITY_EPSILON, braille_history_lines_optional_with_scale,
-    braille_history_lines_with_scale, graph_scale_bounds, graph_scale_bounds_optional,
-    history_viewport_samples, history_viewport_samples_deque,
+    braille_history_lines_optional_with_scale, braille_history_lines_with_scale,
+    graph_scale_bounds, graph_scale_bounds_optional, history_viewport_samples,
+    history_viewport_samples_deque,
 };
 use history::PidKey;
 use ratatui::{
@@ -46,8 +44,8 @@ const SAMPLER_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const SAMPLER_QUEUE_CAPACITY: usize = 8;
 const HISTORY_LIMIT: usize = 240;
 const HISTORY_STALE_TICKS: u64 = HISTORY_LIMIT as u64;
-const OFFENDER_AVG_WINDOW_TICKS: u64 = 60;
-const OFFENDER_PEAK_WINDOW_TICKS: u64 = 60;
+const PROCESS_AVG_WINDOW_TICKS: u64 = 60;
+const PROCESS_PEAK_WINDOW_TICKS: u64 = 60;
 const PERSIST_FLUSH_EVERY_TICKS: u64 = 15;
 
 const COLOR_FG: Color = Color::Rgb(0xab, 0xb2, 0xbf);
@@ -509,6 +507,22 @@ fn chip_line(label: &str, hotkey: Option<char>) -> Vec<Span<'static>> {
     spans
 }
 
+fn action_chip_line(label: &str, hotkey: &str) -> Vec<Span<'static>> {
+    if hotkey.chars().count() == 1 {
+        return chip_line(label, hotkey.chars().next());
+    }
+
+    let label_style = Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    vec![
+        Span::styled(hotkey.to_string(), key_style),
+        Span::styled(format!(" {label}"), label_style),
+    ]
+}
+
 fn draw_chips_on_border_right(
     buf: &mut Buffer,
     area: Rect,
@@ -676,18 +690,9 @@ fn compute_process_col_width(panel_width: u16) -> u16 {
 impl TableLayout {
     fn for_processes(width: u16) -> Self {
         Self {
-            show_pid: width >= 60,
-            show_avg: true,
-            show_peak: true,
-            trend_width: trend_column_width(width),
-        }
-    }
-
-    fn for_offenders(width: u16) -> Self {
-        Self {
-            show_pid: false,
-            show_avg: width >= 70,
-            show_peak: width >= 56,
+            show_pid: width >= 74,
+            show_avg: width >= 58,
+            show_peak: width >= 70,
             trend_width: trend_column_width(width),
         }
     }
@@ -719,16 +724,13 @@ fn trend_sparkline_cell(samples: &[f64], width: u16) -> Cell<'static> {
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
-    app.rebuild_process_visible_if_needed();
-    app.rebuild_offender_visible_if_needed();
+    app.rebuild_process_rows_if_needed();
 
-    let process_visible_len = app.process_visible_indices.len();
-    let offender_visible_len = app.offender_visible_indices.len();
+    let process_visible_len = app.process_rows.len();
     app.normalize_process_selection(process_visible_len);
-    app.normalize_offender_selection(offender_visible_len);
 
     let pinned = app.pinned.clone();
-    let pinned_row = pinned
+    let pinned_live_row = pinned
         .as_ref()
         .and_then(|pin| {
             app.snapshot
@@ -738,18 +740,12 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         })
         .cloned();
 
-    let pinned_rank = pinned.as_ref().and_then(|pin| {
-        app.process_visible_indices.iter().position(|idx| {
-            app.snapshot.rows[*idx].pid == pin.pid && app.snapshot.rows[*idx].process == pin.process
-        })
-    });
-
-    let offender_pinned = app.offender_pinned.clone();
-    let offender_pinned_visible_rank = offender_pinned.as_ref().and_then(|name| {
-        app.offender_visible_indices
+    let pinned_visible_rank = pinned.as_ref().and_then(|pin| {
+        app.process_rows
             .iter()
-            .position(|idx| app.offender_rows[*idx].name == *name)
+            .position(|row| row.key.pid == pin.pid && row.key.process == pin.process)
     });
+    let controls_blocked = app.settings_modal.is_some() || app.is_filter_input_active();
 
     if !app.show_graph && !app.show_table {
         draw_easter_egg(
@@ -803,16 +799,13 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             scale_min,
             scale_max,
         );
-        let mut graph_bottom_spans = hotkey_hint_line("p pause").spans;
+        let mut graph_block = panel_block();
         if let Some(error) = app.last_error.as_deref() {
-            graph_bottom_spans.push(Span::styled(" • ", Style::default().fg(COLOR_MUTED)));
-            graph_bottom_spans.push(Span::styled(
+            graph_block = graph_block.title_bottom(Line::from(Span::styled(
                 format!("error: {error}"),
                 Style::default().fg(COLOR_RED),
-            ));
+            )));
         }
-        let graph_block =
-            panel_block().title_bottom(Line::from(graph_bottom_spans).right_aligned());
         frame.render_widget(graph_block, graph_area);
 
         let mut graph_chips: Vec<Vec<Span<'static>>> = vec![chip_line("¹etop", Some('¹'))];
@@ -860,15 +853,30 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             &right_chips,
         );
 
-        let graph_bottom_chips = vec![chip_line("menu", Some('m'))];
         let bottom_y = graph_area.y + graph_area.height.saturating_sub(1);
-        draw_chips_on_border(
-            frame.buffer_mut(),
-            graph_area,
-            bottom_y,
-            graph_area.x + 1,
-            &graph_bottom_chips,
-        );
+        if !controls_blocked {
+            if !app.show_table {
+                let graph_bottom_left_chips =
+                    vec![action_chip_line("menu", "m"), action_chip_line("quit", "q")];
+                draw_chips_on_border(
+                    frame.buffer_mut(),
+                    graph_area,
+                    bottom_y,
+                    graph_area.x + 1,
+                    &graph_bottom_left_chips,
+                );
+            }
+
+            let graph_bottom_right_chips = vec![action_chip_line("pause", "p")];
+            let right_edge = graph_area.x + graph_area.width.saturating_sub(1);
+            draw_chips_on_border_right(
+                frame.buffer_mut(),
+                graph_area,
+                bottom_y,
+                right_edge,
+                &graph_bottom_right_chips,
+            );
+        }
 
         let graph = Paragraph::new(graph_lines);
         frame.render_widget(graph, graph_inner);
@@ -880,13 +888,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         }
         return;
     };
-    let show_process_table = app.table_mode == TableMode::Processes;
-
-    let show_detail = if show_process_table {
-        pinned.is_some()
-    } else {
-        offender_pinned.is_some()
-    };
+    let show_detail = pinned.is_some();
 
     let (detail_area, rows_area) = if show_detail {
         let min_rows: u16 = 6;
@@ -906,87 +908,172 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         (None, table_region)
     };
 
-    if show_process_table {
-        if let Some(detail_rect) = detail_area {
-            let detail_title = if let Some(pin) = pinned.as_ref() {
-                format!("pinned {}", pin.pid)
+    if let Some(detail_rect) = detail_area {
+        let detail_title = if let Some(pin) = pinned.as_ref() {
+            format!("pinned {}", pin.pid)
+        } else {
+            "pinned process".to_string()
+        };
+
+        let archive_backed_mode = app.graph_range.archive_range().is_some();
+        let detail_range_label = if archive_backed_mode {
+            format!("hist {}", app.graph_range.label())
+        } else {
+            app.graph_range.label().to_string()
+        };
+        let detail_block =
+            panel_block().title_top(format!("{detail_title} • {detail_range_label}"));
+        let detail_inner = detail_block.inner(detail_rect);
+        frame.render_widget(detail_block, detail_rect);
+        if !controls_blocked {
+            let detail_bottom_y = detail_rect.y + detail_rect.height.saturating_sub(1);
+            let detail_right_edge = detail_rect.x + detail_rect.width.saturating_sub(1);
+            let detail_bottom_chips = vec![
+                action_chip_line("range", "r"),
+                action_chip_line("unpin", "Enter"),
+            ];
+            draw_chips_on_border_right(
+                frame.buffer_mut(),
+                detail_rect,
+                detail_bottom_y,
+                detail_right_edge,
+                &detail_bottom_chips,
+            );
+        }
+
+        let pinned_archive_samples = pinned.as_ref().and_then(|pin| {
+            if detail_inner.width == 0 {
+                None
             } else {
-                "pinned process".to_string()
-            };
+                let key = PidKey::new(pin.pid, pin.process.clone());
+                app.pid_archive_samples_for_width(&key, detail_inner.width as usize)
+            }
+        });
 
-            let detail_block = panel_block()
-                .title_top(detail_title)
-                .title_bottom(hotkey_hint_line("Enter unpin").right_aligned());
-            let detail_inner = detail_block.inner(detail_rect);
-            frame.render_widget(detail_block, detail_rect);
+        let text_lines: Vec<Line> = match pinned.as_ref() {
+            Some(pin) => {
+                let key = PidKey::new(pin.pid, pin.process.clone());
+                let current = pinned_live_row
+                    .as_ref()
+                    .map(|row| row.power_num)
+                    .unwrap_or(0.0);
+                let avg = app
+                    .history_store
+                    .pid_avg(&key, PROCESS_AVG_WINDOW_TICKS, app.tick);
+                let peak = app
+                    .history_store
+                    .pid_peak(&key, PROCESS_PEAK_WINDOW_TICKS, app.tick);
+                let rank_text = pinned_visible_rank
+                    .map(|rank| format!("#{} / {}", rank + 1, process_visible_len))
+                    .unwrap_or_else(|| "not in current filtered list".to_string());
 
-            let text_lines: Vec<Line> = match (pinned.as_ref(), pinned_row.as_ref()) {
-                (Some(_), Some(row)) => {
-                    let rank_text = pinned_rank
-                        .map(|rank| format!("#{} / {}", rank + 1, process_visible_len))
-                        .unwrap_or_else(|| "not in current filtered list".to_string());
+                let mut lines = vec![Line::from(Span::styled(
+                    format!("{} ({})", pin.process, pin.pid),
+                    Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
+                ))];
 
-                    vec![
-                        Line::from(Span::styled(
-                            row.process.clone(),
-                            Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(vec![
-                            Span::styled("pid ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(row.pid.to_string(), Style::default().fg(COLOR_FG)),
-                            Span::styled("  pwr ", Style::default().fg(COLOR_MUTED)),
+                lines.push(Line::from(vec![
+                    Span::styled("now ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(
+                        format!("{current:.1}"),
+                        Style::default()
+                            .fg(spectrum_band_color(current, &app.settings.graph_heat))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  avg2m ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
+                    Span::styled("  peak2m ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
+                    Span::styled("  live rank ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(rank_text, Style::default().fg(COLOR_FG)),
+                ]));
+
+                if archive_backed_mode {
+                    match pinned_archive_samples
+                        .as_deref()
+                        .and_then(archive_bucket_metrics)
+                    {
+                        Some(metrics) => lines.push(Line::from(vec![
                             Span::styled(
-                                row.power.clone(),
-                                Style::default()
-                                    .fg(spectrum_band_color(
-                                        row.power_num,
-                                        &app.settings.graph_heat,
-                                    ))
-                                    .add_modifier(Modifier::BOLD),
+                                format!("hist {} pid buckets ", app.graph_range.label()),
+                                Style::default().fg(COLOR_MUTED),
                             ),
-                            Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                        ]),
-                    ]
+                            Span::styled("avg bucket ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{:.1}", metrics.avg_bucket_power),
+                                Style::default().fg(COLOR_FG),
+                            ),
+                            Span::styled("  max bucket avg ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{:.1}", metrics.max_bucket_power),
+                                Style::default().fg(COLOR_FG),
+                            ),
+                            Span::styled("  buckets ", Style::default().fg(COLOR_MUTED)),
+                            Span::styled(
+                                format!("{}", metrics.bucket_count),
+                                Style::default().fg(COLOR_FG),
+                            ),
+                        ])),
+                        None => lines.push(Line::from(Span::styled(
+                            format!(
+                                "hist {} pid buckets: no historical data in selected range.",
+                                app.graph_range.label()
+                            ),
+                            Style::default().fg(COLOR_MUTED),
+                        ))),
+                    }
                 }
-                (Some(pin), None) => vec![
-                    Line::from(Span::styled(
-                        format!("{} ({})", pin.process, pin.pid),
-                        Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
+
+                if pinned_live_row.is_none() {
+                    lines.push(Line::from(Span::styled(
                         "Not present in the latest top sample.",
                         Style::default().fg(COLOR_MUTED),
-                    )),
-                ],
-                _ => vec![],
-            };
+                    )));
+                }
 
-            let text_height = text_lines.len() as u16;
-            let text_rect = Rect {
+                lines
+            }
+            None => vec![],
+        };
+
+        let text_height = text_lines.len() as u16;
+        let text_rect = Rect {
+            x: detail_inner.x,
+            y: detail_inner.y,
+            width: detail_inner.width,
+            height: text_height.min(detail_inner.height),
+        };
+        frame.render_widget(Paragraph::new(text_lines), text_rect);
+
+        let mini_graph_rect = if detail_inner.height > text_height {
+            Some(Rect {
                 x: detail_inner.x,
-                y: detail_inner.y,
+                y: detail_inner.y + text_height,
                 width: detail_inner.width,
-                height: text_height.min(detail_inner.height),
-            };
-            frame.render_widget(Paragraph::new(text_lines), text_rect);
+                height: detail_inner.height - text_height,
+            })
+        } else {
+            None
+        };
 
-            let mini_graph_rect = if detail_inner.height > text_height {
-                Some(Rect {
-                    x: detail_inner.x,
-                    y: detail_inner.y + text_height,
-                    width: detail_inner.width,
-                    height: detail_inner.height - text_height,
-                })
-            } else {
-                None
-            };
-
-            if let (Some(graph_rect), Some(pin)) = (mini_graph_rect, pinned.as_ref()) {
-                let graph_w = graph_rect.width as usize;
-                let graph_h = graph_rect.height as usize;
-                if graph_w > 0 && graph_h > 0 {
-                    let key = PidKey::new(pin.pid, pin.process.clone());
+        if let (Some(graph_rect), Some(pin)) = (mini_graph_rect, pinned.as_ref()) {
+            let graph_w = graph_rect.width as usize;
+            let graph_h = graph_rect.height as usize;
+            if graph_w > 0 && graph_h > 0 {
+                let key = PidKey::new(pin.pid, pin.process.clone());
+                if archive_backed_mode {
+                    if let Some(archive_samples) = pinned_archive_samples.as_ref() {
+                        let (mini_min, mini_max) = graph_scale_bounds_optional(archive_samples);
+                        let mini_lines = braille_history_lines_optional_with_scale(
+                            archive_samples,
+                            graph_w,
+                            graph_h,
+                            mini_min,
+                            mini_max,
+                        );
+                        frame.render_widget(Paragraph::new(mini_lines), graph_rect);
+                    }
+                } else {
                     let history_samples =
                         app.history_store
                             .pid_recent_values(&key, HISTORY_LIMIT as u64, app.tick);
@@ -1003,513 +1090,175 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 }
             }
         }
+    }
 
-        let rows_visible = rows_area.height.saturating_sub(3) as usize;
+    let rows_visible = rows_area.height.saturating_sub(3) as usize;
 
-        if rows_visible > 0 && process_visible_len > 0 {
-            if app.process_selected < app.process_scroll {
-                app.process_scroll = app.process_selected;
-            }
-            if app.process_selected >= app.process_scroll + rows_visible {
-                app.process_scroll = app.process_selected + 1 - rows_visible;
-            }
-        } else {
-            app.process_scroll = 0;
+    if rows_visible > 0 && process_visible_len > 0 {
+        if app.process_selected < app.process_scroll {
+            app.process_scroll = app.process_selected;
         }
-
-        let start = app.process_scroll.min(process_visible_len);
-        let end = if rows_visible == 0 {
-            start
-        } else {
-            (start + rows_visible).min(process_visible_len)
-        };
-
-        let layout = TableLayout::for_processes(rows_area.width);
-        let graph_heat = app.settings.graph_heat.clone();
-        let trend_width = layout.trend_width;
-        let current_tick = app.tick;
-        let rows = app.process_visible_indices[start..end]
-            .iter()
-            .map(|idx| {
-                let r = &app.snapshot.rows[*idx];
-                let is_pinned_row = pinned
-                    .as_ref()
-                    .map(|pin| pin.pid == r.pid && pin.process == r.process)
-                    .unwrap_or(false);
-
-                let mut cells: Vec<Cell<'static>> = Vec::with_capacity(5);
-                cells.push(pin_marker_cell(is_pinned_row));
-                if layout.show_pid {
-                    cells.push(Cell::from(r.pid.to_string()));
-                }
-                cells.push(Cell::from(r.process.clone()));
-                cells.push(
-                    Cell::from(r.power.clone())
-                        .style(Style::default().fg(spectrum_band_color(r.power_num, &graph_heat))),
-                );
-                if trend_width > 0 {
-                    let key = PidKey::new(r.pid, r.process.clone());
-                    let samples = app.history_store.pid_recent_values(
-                        &key,
-                        trend_width as u64 * 2,
-                        current_tick,
-                    );
-                    cells.push(trend_sparkline_cell(&samples, trend_width));
-                }
-                Row::new(cells)
-            })
-            .collect::<Vec<_>>();
-
-        let header_style = Style::default()
-            .fg(COLOR_ACCENT)
-            .add_modifier(Modifier::BOLD);
-        let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(5);
-        header_cells.push(Cell::from(" "));
-        if layout.show_pid {
-            header_cells.push(Cell::from("PID"));
+        if app.process_selected >= app.process_scroll + rows_visible {
+            app.process_scroll = app.process_selected + 1 - rows_visible;
         }
-        header_cells.push(Cell::from("PROCESS"));
-        header_cells.push(Cell::from("POWER"));
-        if layout.trend_width > 0 {
-            header_cells.push(Cell::from("TREND"));
-        }
-        let header_row = Row::new(header_cells).style(header_style);
-
-        let pin_suffix = pinned
-            .as_ref()
-            .map(|pin| format!(" • pinned pid {}", pin.pid))
-            .unwrap_or_default();
-
-        let table_title_right = if app.process_filter_input.is_some() {
-            format!(
-                "{process_visible_len}/{} • filter edit: {}{}",
-                app.snapshot.rows.len(),
-                app.process_active_filter(),
-                pin_suffix,
-            )
-        } else if app.process_filter_query.is_empty() {
-            format!(
-                "{process_visible_len}/{} • power ↓{}",
-                app.snapshot.rows.len(),
-                pin_suffix,
-            )
-        } else {
-            format!(
-                "{process_visible_len}/{} • power ↓ • filter: {}{}",
-                app.snapshot.rows.len(),
-                app.process_filter_query,
-                pin_suffix,
-            )
-        };
-
-        let highlight_style = Style::default()
-            .bg(COLOR_SELECTED_BG)
-            .add_modifier(Modifier::BOLD);
-
-        let table_block = panel_block()
-            .title_top(
-                Line::from(Span::styled(
-                    table_title_right,
-                    Style::default().fg(COLOR_MUTED),
-                ))
-                .right_aligned(),
-            )
-            .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
-
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(5);
-        constraints.push(Constraint::Length(1));
-        if layout.show_pid {
-            constraints.push(Constraint::Length(7));
-        }
-        constraints.push(Constraint::Min(10));
-        constraints.push(Constraint::Length(10));
-        if layout.trend_width > 0 {
-            constraints.push(Constraint::Length(layout.trend_width));
-        }
-
-        let table = Table::new(rows, constraints)
-            .header(header_row)
-            .block(table_block)
-            .column_spacing(1)
-            .style(Style::default().fg(COLOR_FG))
-            .row_highlight_style(highlight_style);
-
-        let selected_in_window = if process_visible_len == 0 || app.is_pinned() {
-            None
-        } else {
-            Some(app.process_selected.saturating_sub(start))
-        };
-        let mut table_state = TableState::default().with_selected(selected_in_window);
-        frame.render_stateful_widget(table, rows_area, &mut table_state);
     } else {
-        if let Some(detail_rect) = detail_area {
-            let detail_title = if let Some(name) = offender_pinned.as_ref() {
-                format!("pinned {name}")
-            } else {
-                "pinned offender".to_string()
-            };
+        app.process_scroll = 0;
+    }
 
-            let archive_backed_mode = app.graph_range.archive_range().is_some();
-            let detail_range_label = if archive_backed_mode {
-                format!("hist {}", app.graph_range.label())
-            } else {
-                app.graph_range.label().to_string()
-            };
-            let detail_block = panel_block()
-                .title_top(format!("{detail_title} • {detail_range_label}"))
-                .title_bottom(hotkey_hint_line("4 range • Enter unpin").right_aligned());
-            let detail_inner = detail_block.inner(detail_rect);
-            frame.render_widget(detail_block, detail_rect);
-            let offender_archive_samples = offender_pinned.as_ref().and_then(|name| {
-                if detail_inner.width == 0 {
-                    None
-                } else {
-                    app.offender_archive_samples_for_width(name, detail_inner.width as usize)
-                }
-            });
+    let start = app.process_scroll.min(process_visible_len);
+    let end = if rows_visible == 0 {
+        start
+    } else {
+        (start + rows_visible).min(process_visible_len)
+    };
 
-            let text_lines: Vec<Line> = match offender_pinned.as_ref() {
-                Some(name) => {
-                    let current = app.history_store.name_current(name);
-                    let avg = app
-                        .history_store
-                        .name_avg(name, OFFENDER_AVG_WINDOW_TICKS, app.tick);
-                    let peak =
-                        app.history_store
-                            .name_peak(name, OFFENDER_PEAK_WINDOW_TICKS, app.tick);
+    let layout = TableLayout::for_processes(rows_area.width);
+    let graph_heat = app.settings.graph_heat.clone();
+    let trend_width = layout.trend_width;
+    let current_tick = app.tick;
+    let sort = app.process_sort;
+    let rows = app.process_rows[start..end]
+        .iter()
+        .map(|row| {
+            let is_pinned_row = pinned
+                .as_ref()
+                .map(|pin| pin.pid == row.key.pid && pin.process == row.key.process)
+                .unwrap_or(false);
 
-                    let rank_text = offender_pinned_visible_rank
-                        .map(|rank| format!("#{} / {}", rank + 1, offender_visible_len))
-                        .unwrap_or_else(|| "not in current filtered list".to_string());
-
-                    let present_in_current = current > GRAPH_ACTIVITY_EPSILON;
-
-                    let mut lines = vec![Line::from(Span::styled(
-                        name.clone(),
-                        Style::default().fg(COLOR_FG).add_modifier(Modifier::BOLD),
-                    ))];
-
-                    if archive_backed_mode {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                "live stats ",
-                                Style::default()
-                                    .fg(COLOR_MUTED)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled("now ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(
-                                format!("{current:.1}"),
-                                Style::default()
-                                    .fg(spectrum_band_color(current, &app.settings.graph_heat))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled("  avg2m ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  peak2m ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  live rank ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                        ]));
-
-                        match offender_archive_samples
-                            .as_deref()
-                            .and_then(archive_bucket_metrics)
-                        {
-                            Some(metrics) => lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!(
-                                        "hist {} grouped-name buckets ",
-                                        app.graph_range.label()
-                                    ),
-                                    Style::default().fg(COLOR_MUTED),
-                                ),
-                                Span::styled("avg bucket ", Style::default().fg(COLOR_MUTED)),
-                                Span::styled(
-                                    format!("{:.1}", metrics.avg_bucket_power),
-                                    Style::default().fg(COLOR_FG),
-                                ),
-                                Span::styled("  max bucket avg ", Style::default().fg(COLOR_MUTED)),
-                                Span::styled(
-                                    format!("{:.1}", metrics.max_bucket_power),
-                                    Style::default().fg(COLOR_FG),
-                                ),
-                                Span::styled("  buckets ", Style::default().fg(COLOR_MUTED)),
-                                Span::styled(
-                                    format!("{}", metrics.bucket_count),
-                                    Style::default().fg(COLOR_FG),
-                                ),
-                            ])),
-                            None => lines.push(Line::from(Span::styled(
-                                format!(
-                                    "hist {} grouped-name buckets: no historical data in selected range.",
-                                    app.graph_range.label()
-                                ),
-                                Style::default().fg(COLOR_MUTED),
-                            ))),
-                        }
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled("now ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(
-                                format!("{current:.1}"),
-                                Style::default()
-                                    .fg(spectrum_band_color(current, &app.settings.graph_heat))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled("  avg2m ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{avg:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  peak ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(format!("{peak:.1}"), Style::default().fg(COLOR_FG)),
-                            Span::styled("  rank ", Style::default().fg(COLOR_MUTED)),
-                            Span::styled(rank_text, Style::default().fg(COLOR_FG)),
-                        ]));
-                    }
-
-                    if !present_in_current {
-                        lines.push(Line::from(Span::styled(
-                            "Not present in the latest live grouped sample.",
-                            Style::default().fg(COLOR_MUTED),
-                        )));
-                    }
-
-                    lines
-                }
-                None => vec![],
-            };
-
-            let text_height = text_lines.len() as u16;
-            let text_rect = Rect {
-                x: detail_inner.x,
-                y: detail_inner.y,
-                width: detail_inner.width,
-                height: text_height.min(detail_inner.height),
-            };
-            frame.render_widget(Paragraph::new(text_lines), text_rect);
-
-            let mini_graph_rect = if detail_inner.height > text_height {
-                Some(Rect {
-                    x: detail_inner.x,
-                    y: detail_inner.y + text_height,
-                    width: detail_inner.width,
-                    height: detail_inner.height - text_height,
-                })
-            } else {
-                None
-            };
-
-            if let (Some(graph_rect), Some(name)) = (mini_graph_rect, offender_pinned.as_ref()) {
-                let graph_w = graph_rect.width as usize;
-                let graph_h = graph_rect.height as usize;
-                if graph_w > 0 && graph_h > 0 {
-                    if let Some(archive_samples) = offender_archive_samples.as_ref() {
-                        let (mini_min, mini_max) = graph_scale_bounds_optional(archive_samples);
-                        let mini_lines = braille_history_lines_optional_with_scale(
-                            archive_samples,
-                            graph_w,
-                            graph_h,
-                            mini_min,
-                            mini_max,
-                        );
-                        frame.render_widget(Paragraph::new(mini_lines), graph_rect);
-                    } else {
-                        let history_samples = app.history_store.name_recent_values(
-                            name,
-                            HISTORY_LIMIT as u64,
-                            app.tick,
-                        );
-                        let samples = history_viewport_samples(&history_samples, graph_w);
-                        let (mini_min, mini_max) = graph_scale_bounds(&samples);
-                        let mini_lines = braille_history_lines_with_scale(
-                            &history_samples,
-                            graph_w,
-                            graph_h,
-                            mini_min,
-                            mini_max,
-                        );
-                        frame.render_widget(Paragraph::new(mini_lines), graph_rect);
-                    }
-                }
+            let mut cells: Vec<Cell<'static>> = Vec::with_capacity(7);
+            cells.push(pin_marker_cell(is_pinned_row));
+            if layout.show_pid {
+                cells.push(Cell::from(row.key.pid.to_string()));
             }
-        }
-
-        let rows_visible = rows_area.height.saturating_sub(3) as usize;
-        let offender_total = app.offender_rows.len();
-
-        if rows_visible > 0 && offender_visible_len > 0 {
-            if app.offender_selected < app.offender_scroll {
-                app.offender_scroll = app.offender_selected;
+            cells.push(Cell::from(row.key.process.clone()));
+            cells.push(
+                Cell::from(format!("{:.1}", row.current))
+                    .style(Style::default().fg(spectrum_band_color(row.current, &graph_heat))),
+            );
+            if layout.show_avg {
+                cells.push(Cell::from(format!("{:.1}", row.avg)));
             }
-            if app.offender_selected >= app.offender_scroll + rows_visible {
-                app.offender_scroll = app.offender_selected + 1 - rows_visible;
+            if layout.show_peak {
+                cells.push(Cell::from(format!("{:.1}", row.peak)));
             }
-        } else {
-            app.offender_scroll = 0;
-        }
-
-        let start = app.offender_scroll.min(offender_visible_len);
-        let end = if rows_visible == 0 {
-            start
-        } else {
-            (start + rows_visible).min(offender_visible_len)
-        };
-
-        let layout = TableLayout::for_offenders(rows_area.width);
-        let heat = app.settings.graph_heat.clone();
-        let sort = app.offender_sort;
-        let trend_width = layout.trend_width;
-        let current_tick = app.tick;
-        let rows = app.offender_visible_indices[start..end]
-            .iter()
-            .map(|idx| {
-                let offender = &app.offender_rows[*idx];
-                let is_pinned_row = offender_pinned
-                    .as_ref()
-                    .map(|name| name == &offender.name)
-                    .unwrap_or(false);
-
-                let mut cells: Vec<Cell<'static>> = Vec::with_capacity(6);
-                cells.push(pin_marker_cell(is_pinned_row));
-                cells.push(Cell::from(offender.name.clone()));
-                cells.push(
-                    Cell::from(format!("{:.1}", offender.current))
-                        .style(Style::default().fg(spectrum_band_color(offender.current, &heat))),
+            if trend_width > 0 {
+                let samples = app.history_store.pid_recent_values(
+                    &row.key,
+                    trend_width as u64 * 2,
+                    current_tick,
                 );
-                if layout.show_avg {
-                    cells.push(Cell::from(format!("{:.1}", offender.avg)));
-                }
-                if layout.show_peak {
-                    cells.push(Cell::from(format!("{:.1}", offender.peak)));
-                }
-                if trend_width > 0 {
-                    let samples = app.history_store.name_recent_values(
-                        &offender.name,
-                        trend_width as u64 * 2,
-                        current_tick,
-                    );
-                    cells.push(trend_sparkline_cell(&samples, trend_width));
-                }
-                Row::new(cells)
-            })
-            .collect::<Vec<_>>();
+                cells.push(trend_sparkline_cell(&samples, trend_width));
+            }
+            Row::new(cells)
+        })
+        .collect::<Vec<_>>();
 
-        let now_width: u16 = 8;
-        let avg_width: u16 = 8;
-        let peak_width: u16 = 8;
+    let now_width: u16 = 8;
+    let avg_width: u16 = 8;
+    let peak_width: u16 = 8;
 
-        let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(5);
-        header_cells.push(Cell::from(" "));
+    let mut header_cells: Vec<Cell<'static>> = Vec::with_capacity(7);
+    header_cells.push(Cell::from(" "));
+    if layout.show_pid {
+        header_cells.push(Cell::from("PID"));
+    }
+    header_cells.push(Cell::from(Span::styled(
+        "PROCESS",
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )));
+    header_cells.push(sort_header_cell(
+        "NOW",
+        sort == app_state::ProcessSort::Current,
+        now_width,
+    ));
+    if layout.show_avg {
+        header_cells.push(sort_header_cell(
+            "AVG2M",
+            sort == app_state::ProcessSort::Avg2m,
+            avg_width,
+        ));
+    }
+    if layout.show_peak {
+        header_cells.push(sort_header_cell(
+            "PEAK",
+            sort == app_state::ProcessSort::Peak,
+            peak_width,
+        ));
+    }
+    if layout.trend_width > 0 {
         header_cells.push(Cell::from(Span::styled(
-            "PROCESS",
+            "TREND",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )));
-        header_cells.push(sort_header_cell(
-            "NOW",
-            sort == OffenderSort::Current,
-            now_width,
-        ));
-        if layout.show_avg {
-            header_cells.push(sort_header_cell(
-                "AVG2M",
-                sort == OffenderSort::Avg2m,
-                avg_width,
-            ));
-        }
-        if layout.show_peak {
-            header_cells.push(sort_header_cell(
-                "PEAK",
-                sort == OffenderSort::Peak,
-                peak_width,
-            ));
-        }
-        if layout.trend_width > 0 {
-            header_cells.push(Cell::from(Span::styled(
-                "TREND",
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        let header_row = Row::new(header_cells);
+    }
+    let header_row = Row::new(header_cells);
 
-        let pin_suffix = offender_pinned
-            .as_ref()
-            .map(|name| format!(" • pinned {name}"))
-            .unwrap_or_default();
+    let table_title_right = if app.process_filter_input.is_some() {
+        format!(
+            "{process_visible_len}/{} • filter edit: {}",
+            app.snapshot.rows.len(),
+            app.process_active_filter(),
+        )
+    } else if app.process_filter_query.is_empty() {
+        format!("{process_visible_len}/{}", app.snapshot.rows.len())
+    } else {
+        format!(
+            "{process_visible_len}/{} • filter: {}",
+            app.snapshot.rows.len(),
+            app.process_filter_query,
+        )
+    };
 
-        let table_title_right = if app.offender_filter_input.is_some() {
-            format!(
-                "{offender_visible_len}/{offender_total} • filter edit: {} • sort {}{}",
-                app.offender_active_filter(),
-                app.offender_sort.title_label(),
-                pin_suffix,
-            )
-        } else if app.offender_filter_query.is_empty() {
-            format!(
-                "{offender_visible_len}/{offender_total} • sort {}{}",
-                app.offender_sort.title_label(),
-                pin_suffix,
-            )
-        } else {
-            format!(
-                "{offender_visible_len}/{offender_total} • filter: {} • sort {}{}",
-                app.offender_filter_query,
-                app.offender_sort.title_label(),
-                pin_suffix,
-            )
-        };
+    let highlight_style = Style::default()
+        .bg(COLOR_SELECTED_BG)
+        .add_modifier(Modifier::BOLD);
 
-        let highlight_style = Style::default()
-            .bg(COLOR_SELECTED_BG)
-            .add_modifier(Modifier::BOLD);
+    let table_block = panel_block().title_top(
+        Line::from(Span::styled(
+            table_title_right,
+            Style::default().fg(COLOR_MUTED),
+        ))
+        .right_aligned(),
+    );
 
-        let table_block = panel_block()
-            .title_top(
-                Line::from(Span::styled(
-                    table_title_right,
-                    Style::default().fg(COLOR_MUTED),
-                ))
-                .right_aligned(),
-            )
-            .title_bottom(hotkey_hint_line(app.status_hint_text()).right_aligned());
-
-        let process_col_width = compute_process_col_width(rows_area.width);
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(6);
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Min(process_col_width));
-        constraints.push(Constraint::Length(now_width));
-        if layout.show_avg {
-            constraints.push(Constraint::Length(avg_width));
-        }
-        if layout.show_peak {
-            constraints.push(Constraint::Length(peak_width));
-        }
-        if layout.trend_width > 0 {
-            constraints.push(Constraint::Length(layout.trend_width));
-        }
-
-        let table = Table::new(rows, constraints)
-            .header(header_row)
-            .block(table_block)
-            .column_spacing(1)
-            .style(Style::default().fg(COLOR_FG))
-            .row_highlight_style(highlight_style);
-
-        let selected_in_window = if offender_visible_len == 0 || app.is_offender_pinned() {
-            None
-        } else {
-            Some(app.offender_selected.saturating_sub(start))
-        };
-        let mut table_state = TableState::default().with_selected(selected_in_window);
-        frame.render_stateful_widget(table, rows_area, &mut table_state);
+    let process_col_width = compute_process_col_width(rows_area.width);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(7);
+    constraints.push(Constraint::Length(1));
+    if layout.show_pid {
+        constraints.push(Constraint::Length(7));
+    }
+    constraints.push(Constraint::Min(process_col_width));
+    constraints.push(Constraint::Length(now_width));
+    if layout.show_avg {
+        constraints.push(Constraint::Length(avg_width));
+    }
+    if layout.show_peak {
+        constraints.push(Constraint::Length(peak_width));
+    }
+    if layout.trend_width > 0 {
+        constraints.push(Constraint::Length(layout.trend_width));
     }
 
-    let table_chips = vec![
-        chip_line("²processes", Some('²')),
-        chip_line("³offenders", Some('³')),
-    ];
+    let table = Table::new(rows, constraints)
+        .header(header_row)
+        .block(table_block)
+        .column_spacing(1)
+        .style(Style::default().fg(COLOR_FG))
+        .row_highlight_style(highlight_style);
+
+    let selected_in_window = if process_visible_len == 0 || app.is_pinned() {
+        None
+    } else {
+        Some(app.process_selected.saturating_sub(start))
+    };
+    let mut table_state = TableState::default().with_selected(selected_in_window);
+    frame.render_stateful_widget(table, rows_area, &mut table_state);
+
+    let table_chips = vec![chip_line("²processes", Some('²'))];
     draw_chips_on_border(
         frame.buffer_mut(),
         rows_area,
@@ -1518,19 +1267,29 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         &table_chips,
     );
 
-    let bottom_chips: Vec<Vec<Span<'static>>> = app
-        .status_hint_chips()
-        .into_iter()
-        .map(|(label, hotkey)| chip_line(label, Some(hotkey)))
-        .collect();
-    if !bottom_chips.is_empty() {
+    if !controls_blocked {
         let bottom_y = rows_area.y + rows_area.height.saturating_sub(1);
+        let bottom_left_chips = vec![
+            action_chip_line("menu", "m"),
+            action_chip_line("filter", "f"),
+            action_chip_line("quit", "q"),
+        ];
         draw_chips_on_border(
             frame.buffer_mut(),
             rows_area,
             bottom_y,
             rows_area.x + 1,
-            &bottom_chips,
+            &bottom_left_chips,
+        );
+
+        let bottom_right_chips = vec![action_chip_line("sort", "s")];
+        let right_edge = rows_area.x + rows_area.width.saturating_sub(1);
+        draw_chips_on_border_right(
+            frame.buffer_mut(),
+            rows_area,
+            bottom_y,
+            right_edge,
+            &bottom_right_chips,
         );
     }
 
@@ -1835,7 +1594,7 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
     }
 
-    fn seed_offender_sort_history(app: &mut App) {
+    fn seed_process_sort_history(app: &mut App) {
         app.apply_snapshot(snapshot_from_rows(vec![
             row(10, "Safari", 60.0),
             row(20, "Mail", 20.0),
@@ -1846,51 +1605,73 @@ mod tests {
             row(20, "Mail", 20.0),
             row(30, "Slack", 6.0),
         ]));
-        app.table_mode = TableMode::Offenders;
     }
 
-    fn offender_names_in_visible_order(app: &mut App) -> Vec<String> {
-        app.rebuild_offender_visible_if_needed();
-        app.offender_visible_indices
+    fn process_identities_in_visible_order(app: &mut App) -> Vec<(i32, String)> {
+        app.rebuild_process_rows_if_needed();
+        app.process_rows
             .iter()
-            .map(|idx| app.offender_rows[*idx].name.clone())
+            .map(|row| (row.key.pid, row.key.process.clone()))
             .collect()
     }
 
     #[test]
-    fn offender_sort_cycles_with_s_key_and_wraps() {
+    fn process_sort_cycles_with_s_key_and_wraps() {
         let mut app = App::new();
-        app.table_mode = TableMode::Offenders;
 
-        assert_eq!(app.offender_sort, OffenderSort::Current);
-
-        app.handle_key(key_press('s'));
-        assert_eq!(app.offender_sort, OffenderSort::Avg2m);
+        assert_eq!(app.process_sort, app_state::ProcessSort::Current);
 
         app.handle_key(key_press('s'));
-        assert_eq!(app.offender_sort, OffenderSort::Peak);
+        assert_eq!(app.process_sort, app_state::ProcessSort::Avg2m);
 
         app.handle_key(key_press('s'));
-        assert_eq!(app.offender_sort, OffenderSort::Current);
+        assert_eq!(app.process_sort, app_state::ProcessSort::Peak);
+
+        app.handle_key(key_press('s'));
+        assert_eq!(app.process_sort, app_state::ProcessSort::Current);
     }
 
     #[test]
-    fn graph_range_cycles_with_4_key_and_wraps() {
+    fn graph_range_cycles_with_r_key_and_wraps() {
         let mut app = App::new();
 
         assert_eq!(app.graph_range, GraphRange::Minutes8);
 
-        app.handle_key(key_press('4'));
+        app.handle_key(key_press('r'));
         assert_eq!(app.graph_range, GraphRange::Minutes30);
 
-        app.handle_key(key_press('4'));
+        app.handle_key(key_press('r'));
         assert_eq!(app.graph_range, GraphRange::Hours3);
 
-        app.handle_key(key_press('4'));
+        app.handle_key(key_press('r'));
         assert_eq!(app.graph_range, GraphRange::Hours12);
 
-        app.handle_key(key_press('4'));
+        app.handle_key(key_press('r'));
         assert_eq!(app.graph_range, GraphRange::Minutes8);
+    }
+
+    #[test]
+    fn f_key_starts_filter_input_and_slash_does_not() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(20, "Mail", 4.0),
+        ]));
+
+        app.handle_key(key_press('f'));
+        assert_eq!(app.process_filter_input.as_deref(), Some(""));
+
+        app.handle_key(key_press('x'));
+        assert_eq!(app.process_filter_input.as_deref(), Some("x"));
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.process_filter_input.is_none());
+
+        app.handle_key(key_press('/'));
+        assert!(app.process_filter_input.is_none());
     }
 
     #[test]
@@ -1914,15 +1695,17 @@ mod tests {
     }
 
     #[test]
-    fn pinned_offender_history_uses_archive_grouped_data_for_ranges_above_8m() {
+    fn pinned_process_history_uses_archive_pid_data_for_ranges_above_8m() {
         let mut app = App::new();
+        let key = PidKey::new(10, "Safari");
         app.archive = persistence::ArchiveState {
             raw_2s: VecDeque::from(vec![persistence::TierSample {
                 bucket_start_secs: 1_700,
                 sample_count: 2,
                 total_power_sum: 40.0,
-                groups: vec![persistence::GroupPowerSum {
-                    name: "Safari".to_string(),
+                processes: vec![persistence::ArchivedProcessPower {
+                    pid: 10,
+                    process: "Safari".to_string(),
                     power_sum: 18.0,
                 }],
                 gap_before: false,
@@ -1931,39 +1714,61 @@ mod tests {
         };
 
         app.graph_range = GraphRange::Minutes8;
-        assert!(
-            app.offender_archive_samples_for_width("Safari", 3)
-                .is_none()
-        );
+        assert!(app.pid_archive_samples_for_width(&key, 3).is_none());
 
         app.graph_range = GraphRange::Minutes30;
         let samples = app
-            .offender_archive_samples_for_width("Safari", 3)
-            .expect("30m range should use grouped archive data");
+            .pid_archive_samples_for_width(&key, 3)
+            .expect("30m range should use exact-pid archive data");
 
         assert_eq!(samples.len(), 6);
         assert_eq!(samples[5], Some(9.0));
     }
 
     #[test]
-    fn process_mode_ignores_s_sort_key() {
+    fn process_sort_changes_visible_ordering_by_metric() {
         let mut app = App::new();
-        app.table_mode = TableMode::Processes;
-        app.offender_sort = OffenderSort::Peak;
+        seed_process_sort_history(&mut app);
+
+        assert_eq!(
+            process_identities_in_visible_order(&mut app),
+            vec![
+                (20, "Mail".to_string()),
+                (30, "Slack".to_string()),
+                (10, "Safari".to_string()),
+            ]
+        );
 
         app.handle_key(key_press('s'));
+        assert_eq!(app.process_sort, app_state::ProcessSort::Avg2m);
+        assert_eq!(
+            process_identities_in_visible_order(&mut app),
+            vec![
+                (10, "Safari".to_string()),
+                (20, "Mail".to_string()),
+                (30, "Slack".to_string()),
+            ]
+        );
 
-        assert_eq!(app.offender_sort, OffenderSort::Peak);
+        app.handle_key(key_press('s'));
+        assert_eq!(app.process_sort, app_state::ProcessSort::Peak);
+        assert_eq!(
+            process_identities_in_visible_order(&mut app),
+            vec![
+                (10, "Safari".to_string()),
+                (20, "Mail".to_string()),
+                (30, "Slack".to_string()),
+            ]
+        );
     }
 
     #[test]
-    fn enter_toggles_process_pin_in_process_mode() {
+    fn enter_toggles_process_pin() {
         let mut app = App::new();
         app.apply_snapshot(snapshot_from_rows(vec![
             row(10, "Safari", 8.0),
             row(20, "Mail", 4.0),
         ]));
-        app.table_mode = TableMode::Processes;
 
         app.handle_key(key_enter());
         let pinned = app.pinned.as_ref().expect("process should be pinned");
@@ -1975,120 +1780,35 @@ mod tests {
     }
 
     #[test]
-    fn enter_toggles_offender_pin_in_offender_mode() {
+    fn process_sort_cycle_preserves_selected_pid_when_possible() {
         let mut app = App::new();
-        seed_offender_sort_history(&mut app);
+        seed_process_sort_history(&mut app);
 
-        let selected_name = app
-            .selected_offender_name()
-            .expect("selected offender should exist");
-
-        app.handle_key(key_enter());
-        assert_eq!(app.offender_pinned.as_deref(), Some(selected_name.as_str()));
-
-        app.handle_key(key_enter());
-        assert!(app.offender_pinned.is_none());
-    }
-
-    #[test]
-    fn offender_enter_does_not_clear_existing_process_pin() {
-        let mut app = App::new();
-        app.apply_snapshot(snapshot_from_rows(vec![
-            row(10, "Safari", 8.0),
-            row(20, "Mail", 4.0),
-        ]));
-
-        app.table_mode = TableMode::Processes;
-        app.handle_key(key_enter());
-        let process_pin = app
-            .pinned
-            .as_ref()
-            .expect("process should be pinned")
-            .clone();
-
-        app.table_mode = TableMode::Offenders;
-        app.handle_key(key_enter());
-        assert!(app.offender_pinned.is_some());
-
-        let still_pinned = app
-            .pinned
-            .as_ref()
-            .expect("process pin should remain while offender pinning");
-        assert_eq!(still_pinned.pid, process_pin.pid);
-        assert_eq!(still_pinned.process, process_pin.process);
-
-        app.handle_key(key_enter());
-        assert!(app.offender_pinned.is_none());
-        assert!(app.pinned.is_some());
-    }
-
-    #[test]
-    fn offender_sort_changes_visible_ordering_by_metric() {
-        let mut app = App::new();
-        seed_offender_sort_history(&mut app);
-
-        assert_eq!(
-            offender_names_in_visible_order(&mut app),
-            vec![
-                "Mail".to_string(),
-                "Slack".to_string(),
-                "Safari".to_string(),
-            ]
-        );
-
-        app.cycle_offender_sort();
-        assert_eq!(app.offender_sort, OffenderSort::Avg2m);
-        assert_eq!(
-            offender_names_in_visible_order(&mut app),
-            vec![
-                "Safari".to_string(),
-                "Mail".to_string(),
-                "Slack".to_string(),
-            ]
-        );
-
-        app.cycle_offender_sort();
-        assert_eq!(app.offender_sort, OffenderSort::Peak);
-        assert_eq!(
-            offender_names_in_visible_order(&mut app),
-            vec![
-                "Safari".to_string(),
-                "Mail".to_string(),
-                "Slack".to_string(),
-            ]
-        );
-
-        app.cycle_offender_sort();
-        assert_eq!(app.offender_sort, OffenderSort::Current);
-    }
-
-    #[test]
-    fn offender_sort_cycle_preserves_selected_name_when_possible() {
-        let mut app = App::new();
-        seed_offender_sort_history(&mut app);
-
-        app.offender_selected = 1;
+        app.process_selected = 1;
         let selected_before = app
-            .selected_offender_name()
-            .expect("selected offender should exist");
-        assert_eq!(selected_before, "Slack");
+            .selected_process_key()
+            .expect("selected process should exist");
+        assert_eq!(selected_before.pid, 30);
 
         app.handle_key(key_press('s'));
 
         let selected_after = app
-            .selected_offender_name()
-            .expect("selected offender should still exist");
-        assert_eq!(selected_after, "Slack");
-        assert_eq!(app.offender_selected, 2);
+            .selected_process_key()
+            .expect("selected process should still exist");
+        assert_eq!(selected_after.pid, 30);
+        assert_eq!(app.process_selected, 2);
     }
 
     #[test]
-    fn offender_selection_survives_snapshot_reorder_by_name() {
+    fn process_selection_survives_snapshot_reorder_by_metric() {
         let mut app = App::new();
-        seed_offender_sort_history(&mut app);
+        seed_process_sort_history(&mut app);
 
-        app.offender_selected = 1;
-        assert_eq!(app.selected_offender_name().as_deref(), Some("Slack"));
+        app.process_selected = 1;
+        assert_eq!(
+            app.selected_process_key().as_ref().map(|key| key.pid),
+            Some(30)
+        );
 
         app.apply_snapshot(snapshot_from_rows(vec![
             row(10, "Safari", 30.0),
@@ -2096,35 +1816,69 @@ mod tests {
             row(30, "Slack", 5.0),
         ]));
 
-        assert_eq!(app.selected_offender_name().as_deref(), Some("Slack"));
-        assert_eq!(app.offender_selected, 2);
+        assert_eq!(
+            app.selected_process_key().as_ref().map(|key| key.pid),
+            Some(30)
+        );
+        assert_eq!(app.process_selected, 2);
     }
 
     #[test]
-    fn offender_filter_matches_group_name_only() {
+    fn process_selection_tracks_exact_pid_even_with_same_name() {
+        let mut app = App::new();
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(10, "Safari", 8.0),
+            row(11, "Safari", 6.0),
+            row(20, "Mail", 4.0),
+        ]));
+
+        app.process_selected = 1;
+        assert_eq!(
+            app.selected_process_key().as_ref().map(|key| key.pid),
+            Some(11)
+        );
+
+        app.apply_snapshot(snapshot_from_rows(vec![
+            row(11, "Safari", 12.0),
+            row(10, "Safari", 2.0),
+            row(20, "Mail", 4.0),
+        ]));
+
+        assert_eq!(
+            app.selected_process_key().as_ref().map(|key| key.pid),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn process_filter_matches_name_or_pid() {
         let mut app = App::new();
         app.apply_snapshot(snapshot_from_rows(vec![
             row(101, "Safari", 12.0),
             row(202, "Mail", 4.0),
+            row(303, "Safari GPU", 3.0),
         ]));
 
-        app.table_mode = TableMode::Offenders;
+        app.process_filter_query = "saf".to_string();
+        app.mark_process_rows_dirty();
+        let visible_len = app.process_visible_len();
 
-        app.offender_filter_query = "saf".to_string();
-        app.mark_offender_visible_dirty();
-        let visible_len = app.offender_visible_len();
+        assert_eq!(visible_len, 2);
+        assert_eq!(
+            process_identities_in_visible_order(&mut app),
+            vec![(101, "Safari".to_string()), (303, "Safari GPU".to_string())]
+        );
 
-        assert_eq!(visible_len, 1);
-        let idx = app.offender_visible_indices[0];
-        assert_eq!(app.offender_rows[idx].name, "Safari");
-
-        app.offender_filter_query = "101".to_string();
-        app.mark_offender_visible_dirty();
-        assert_eq!(app.offender_visible_len(), 0);
+        app.process_filter_query = "101".to_string();
+        app.mark_process_rows_dirty();
+        assert_eq!(
+            process_identities_in_visible_order(&mut app),
+            vec![(101, "Safari".to_string())]
+        );
     }
 
     #[test]
-    fn offender_selection_normalizes_after_filter_changes_result_size() {
+    fn process_selection_normalizes_after_filter_changes_result_size() {
         let mut app = App::new();
         app.apply_snapshot(snapshot_from_rows(vec![
             row(10, "Safari", 8.0),
@@ -2132,20 +1886,19 @@ mod tests {
             row(30, "Slack", 4.0),
         ]));
 
-        app.table_mode = TableMode::Offenders;
-        assert_eq!(app.offender_visible_len(), 3);
+        assert_eq!(app.process_visible_len(), 3);
 
-        app.offender_selected = 2;
-        app.offender_scroll = 2;
+        app.process_selected = 2;
+        app.process_scroll = 2;
 
-        app.offender_filter_query = "mail".to_string();
-        app.mark_offender_visible_dirty();
-        let visible_len = app.offender_visible_len();
-        app.normalize_offender_selection(visible_len);
+        app.process_filter_query = "mail".to_string();
+        app.mark_process_rows_dirty();
+        let visible_len = app.process_visible_len();
+        app.normalize_process_selection(visible_len);
 
         assert_eq!(visible_len, 1);
-        assert_eq!(app.offender_selected, 0);
-        assert_eq!(app.offender_scroll, 0);
+        assert_eq!(app.process_selected, 0);
+        assert_eq!(app.process_scroll, 0);
     }
 
     #[test]
@@ -2185,7 +1938,11 @@ mod tests {
             100,
             persistence::continuity_threshold_secs(REFRESH_EVERY),
             12.0,
-            [("Safari".to_string(), 12.0)],
+            [persistence::LiveProcessSample {
+                pid: 10,
+                process: "Safari".to_string(),
+                power: 12.0,
+            }],
         );
 
         app.apply_loaded_session_cache(persistence::LoadedSessionCache {
@@ -2210,7 +1967,10 @@ mod tests {
         assert!(app.power_history.is_empty());
         assert!(app.live_snapshot_history.is_empty());
         assert_eq!(app.tick, 0);
-        assert_eq!(app.history_store.name_current("Safari"), 0.0);
+        assert_eq!(
+            app.history_store.pid_current(&PidKey::new(10, "Safari")),
+            0.0
+        );
         assert_eq!(app.archive, archive);
         assert!(app.loading);
         assert!(app.snapshot.rows.is_empty());

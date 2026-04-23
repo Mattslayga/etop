@@ -88,19 +88,10 @@ impl Series {
 }
 
 #[derive(Debug, Clone)]
-pub struct NameOffenderMetrics {
-    pub name: String,
-    pub current: f64,
-    pub avg: f64,
-    pub peak: f64,
-}
-
-#[derive(Debug, Clone)]
 pub struct HistoryStore {
     max_samples: usize,
     stale_after_ticks: u64,
     by_pid: HashMap<PidKey, Series>,
-    by_name: HashMap<String, Series>,
 }
 
 impl HistoryStore {
@@ -109,7 +100,6 @@ impl HistoryStore {
             max_samples: max_samples.max(1),
             stale_after_ticks,
             by_pid: HashMap::new(),
-            by_name: HashMap::new(),
         }
     }
 
@@ -118,7 +108,6 @@ impl HistoryStore {
         I: IntoIterator<Item = ProcessSample<'a>>,
     {
         let mut seen_pids: HashSet<PidKey> = HashSet::new();
-        let mut name_totals: HashMap<String, f64> = HashMap::new();
 
         for sample in samples {
             let key = PidKey::new(sample.pid, sample.process.to_string());
@@ -126,16 +115,6 @@ impl HistoryStore {
             entry.last_seen_tick = tick;
             entry.push(tick, sample.power, self.max_samples);
             seen_pids.insert(key);
-
-            *name_totals.entry(sample.process.to_string()).or_insert(0.0) += sample.power;
-        }
-
-        let seen_names: HashSet<String> = name_totals.keys().cloned().collect();
-
-        for (name, total) in name_totals {
-            let entry = self.by_name.entry(name).or_default();
-            entry.last_seen_tick = tick;
-            entry.push(tick, total, self.max_samples);
         }
 
         for (key, series) in self.by_pid.iter_mut() {
@@ -144,16 +123,8 @@ impl HistoryStore {
             }
         }
 
-        for (name, series) in self.by_name.iter_mut() {
-            if !seen_names.contains(name) {
-                series.push(tick, 0.0, self.max_samples);
-            }
-        }
-
         let stale_after_ticks = self.stale_after_ticks;
         self.by_pid
-            .retain(|_, series| tick.saturating_sub(series.last_seen_tick) <= stale_after_ticks);
-        self.by_name
             .retain(|_, series| tick.saturating_sub(series.last_seen_tick) <= stale_after_ticks);
     }
 
@@ -187,68 +158,6 @@ impl HistoryStore {
             .map(|series| series.recent_values_since_tick(min_tick))
             .unwrap_or_default()
     }
-
-    pub fn name_current(&self, name: &str) -> f64 {
-        self.by_name.get(name).map(Series::current).unwrap_or(0.0)
-    }
-
-    pub fn name_avg(&self, name: &str, window_ticks: u64, now_tick: u64) -> f64 {
-        let min_tick = now_tick.saturating_sub(window_ticks.saturating_sub(1));
-        self.by_name
-            .get(name)
-            .map(|series| series.avg_since_tick(min_tick))
-            .unwrap_or(0.0)
-    }
-
-    pub fn name_peak(&self, name: &str, window_ticks: u64, now_tick: u64) -> f64 {
-        let min_tick = now_tick.saturating_sub(window_ticks.saturating_sub(1));
-        self.by_name
-            .get(name)
-            .map(|series| series.peak_since_tick(min_tick))
-            .unwrap_or(0.0)
-    }
-
-    pub fn name_recent_values(&self, name: &str, window_ticks: u64, now_tick: u64) -> Vec<f64> {
-        let min_tick = now_tick.saturating_sub(window_ticks.saturating_sub(1));
-        self.by_name
-            .get(name)
-            .map(|series| series.recent_values_since_tick(min_tick))
-            .unwrap_or_default()
-    }
-
-    pub fn top_name_offenders(
-        &self,
-        now_tick: u64,
-        avg_window_ticks: u64,
-        peak_window_ticks: u64,
-        limit: usize,
-    ) -> Vec<NameOffenderMetrics> {
-        let mut offenders: Vec<NameOffenderMetrics> = self
-            .by_name
-            .keys()
-            .map(|name| NameOffenderMetrics {
-                name: name.clone(),
-                current: self.name_current(name),
-                avg: self.name_avg(name, avg_window_ticks, now_tick),
-                peak: self.name_peak(name, peak_window_ticks, now_tick),
-            })
-            .collect();
-
-        offenders.sort_by(|a, b| {
-            b.current
-                .partial_cmp(&a.current)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.avg
-                        .partial_cmp(&a.avg)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.name.cmp(&b.name))
-        });
-
-        offenders.truncate(limit);
-        offenders
-    }
 }
 
 #[cfg(test)]
@@ -261,15 +170,6 @@ mod tests {
             process,
             power,
         }
-    }
-
-    #[test]
-    fn groups_by_exact_process_name() {
-        let mut store = HistoryStore::new(8, 8);
-
-        store.update(1, [s(10, "Safari", 4.0), s(11, "Safari", 2.0)]);
-
-        assert_eq!(store.name_current("Safari"), 6.0);
     }
 
     #[test]
@@ -299,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn evicts_stale_pid_and_name_series() {
+    fn evicts_stale_pid_series() {
         let mut store = HistoryStore::new(8, 2);
         let key = PidKey::new(10, "Safari");
 
@@ -309,32 +209,19 @@ mod tests {
         store.update(4, []);
 
         assert_eq!(store.pid_current(&key), 0.0);
-        assert_eq!(store.name_current("Safari"), 0.0);
     }
 
     #[test]
-    fn bounded_history_uses_vecdeque_limit() {
-        let mut store = HistoryStore::new(3, 10);
-
-        store.update(1, [s(10, "Safari", 1.0)]);
-        store.update(2, [s(10, "Safari", 2.0)]);
-        store.update(3, [s(10, "Safari", 3.0)]);
-        store.update(4, [s(10, "Safari", 4.0)]);
-
-        let values = store.name_recent_values("Safari", 10, 4);
-        assert_eq!(values, vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn computes_avg_and_peak() {
+    fn computes_pid_avg_and_peak() {
         let mut store = HistoryStore::new(16, 16);
+        let key = PidKey::new(10, "Safari");
 
         store.update(1, [s(10, "Safari", 2.0)]);
         store.update(2, [s(10, "Safari", 4.0)]);
         store.update(3, [s(10, "Safari", 6.0)]);
 
-        assert_eq!(store.name_avg("Safari", 2, 3), 5.0);
-        assert_eq!(store.name_peak("Safari", 3, 3), 6.0);
+        assert_eq!(store.pid_avg(&key, 2, 3), 5.0);
+        assert_eq!(store.pid_peak(&key, 3, 3), 6.0);
     }
 
     #[test]
@@ -347,33 +234,5 @@ mod tests {
         store.update(3, [s(10, "Safari GPU", 7.0)]);
 
         assert_eq!(store.pid_recent_values(&key, 3, 3), vec![2.0, 4.0, 0.0]);
-    }
-
-    #[test]
-    fn top_offenders_sorted_by_current_then_avg() {
-        let mut store = HistoryStore::new(16, 16);
-
-        store.update(
-            1,
-            [
-                s(10, "Safari", 6.0),
-                s(11, "Mail", 3.0),
-                s(12, "Slack", 3.0),
-            ],
-        );
-        store.update(
-            2,
-            [
-                s(10, "Safari", 4.0),
-                s(11, "Mail", 3.5),
-                s(12, "Slack", 3.0),
-            ],
-        );
-
-        let offenders = store.top_name_offenders(2, 2, 2, 3);
-        assert_eq!(offenders.len(), 3);
-        assert_eq!(offenders[0].name, "Safari");
-        assert_eq!(offenders[1].name, "Mail");
-        assert_eq!(offenders[2].name, "Slack");
     }
 }
