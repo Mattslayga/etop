@@ -35,17 +35,29 @@ Palette cues used in the TUI:
 - `q` quit
 - `j/k` or `↑/↓` move selection (when not pinned)
 - `g/G` jump to top/bottom (when not pinned)
-- `/` start filter input
+- `f` start filter input
   - type to edit filter
   - `Enter` apply
   - `Esc` cancel edit and keep current filter
+- `d` clear the active filter
 - `p` pause/resume refresh
+- `s` cycle process sort
+- `r` cycle pinned history range
 - `Enter` pin/unpin process details
 - `m` open graph-threshold settings modal
   - `↑/↓` or `j/k` move fields
   - `Enter` edit/confirm field value
   - `m` apply settings and close
   - `Esc` cancel field edit or close without applying
+
+## CLI
+
+```bash
+etop --help
+etop --version
+etop --dump-once
+etop update
+```
 
 ## Platform support
 
@@ -56,17 +68,25 @@ Palette cues used in the TUI:
 ## Install with Homebrew (Apple Silicon macOS)
 
 ```bash
-brew tap Mattslayga/etop
-brew install etop
-```
-
-One-line equivalent:
-
-```bash
 brew install Mattslayga/etop/etop
 ```
 
 This installs the current Apple Silicon macOS release from the `Mattslayga/homebrew-etop` tap.
+
+## Update with Homebrew
+
+```bash
+brew update
+brew upgrade etop
+```
+
+If Homebrew has cached a stale local tap checkout, refresh it explicitly:
+
+```bash
+brew untap Mattslayga/etop
+brew tap Mattslayga/etop
+brew reinstall etop
+```
 
 ## Install / run from source
 
@@ -82,12 +102,29 @@ cargo build --release
 ./target/release/etop
 ```
 
-## Install / run from GitHub Releases (Apple Silicon macOS)
+## Install from the repo installer (Apple Silicon macOS)
+
+Review the script, then run it locally:
 
 ```bash
-# replace <owner>, <repo>, and vX.Y.Z
+curl -fsSL -o install-etop.sh \
+  https://raw.githubusercontent.com/Mattslayga/etop/main/install.sh
+
+sh install-etop.sh
+```
+
+By default this installs into `~/.local/bin`. To install a specific release:
+
+```bash
+sh install-etop.sh --version vX.Y.Z
+```
+
+## Install / run from GitHub Releases directly (Apple Silicon macOS)
+
+```bash
+# replace vX.Y.Z
 curl -L -o etop.tar.gz \
-  https://github.com/<owner>/<repo>/releases/download/vX.Y.Z/etop-vX.Y.Z-macos-aarch64.tar.gz
+  https://github.com/Mattslayga/etop/releases/download/vX.Y.Z/etop-vX.Y.Z-macos-aarch64.tar.gz
 
 tar -xzf etop.tar.gz
 ./etop
@@ -96,6 +133,12 @@ tar -xzf etop.tar.gz
 ## License
 
 MIT
+
+## Contributors
+
+- Matt Slayga
+- OpenAI Codex
+- Anthropic Claude
 
 ## Notes
 

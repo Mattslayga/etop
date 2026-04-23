@@ -12,6 +12,8 @@ jobs:
   macos-arm64:
     name: macOS Apple Silicon release
     runs-on: macos-14
+    env:
+      ASSET_NAME: etop-${{ github.ref_name }}-macos-aarch64.tar.gz
 
     steps:
       - name: Checkout
@@ -28,10 +30,58 @@ jobs:
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/etop dist/etop
           chmod +x dist/etop
-          tar -C dist -czf "etop-${{ github.ref_name }}-macos-aarch64.tar.gz" etop
+          tar -C dist -czf "$ASSET_NAME" etop
+
+      - name: Compute release asset SHA256
+        id: asset
+        run: |
+          digest="$(shasum -a 256 "$ASSET_NAME" | awk '{print $1}')"
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v3
         with:
-          files: etop-${{ github.ref_name }}-macos-aarch64.tar.gz
+          files: ${{ env.ASSET_NAME }}
           generate_release_notes: true
+
+      - name: Update Homebrew tap
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: Mattslayga/homebrew-etop
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA256: ${{ steps.asset.outputs.sha256 }}
+        run: |
+          set -eu
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cat > tap/Formula/etop.rb <<EOF
+          class Etop < Formula
+            desc "Local-only macOS TUI process viewer focused on power usage and energy impact"
+            homepage "https://github.com/Mattslayga/etop"
+            url "https://github.com/Mattslayga/etop/releases/download/${RELEASE_TAG}/etop-${RELEASE_TAG}-macos-aarch64.tar.gz"
+            sha256 "${RELEASE_SHA256}"
+            license "MIT"
+
+            on_macos do
+              depends_on arch: :arm64
+            end
+
+            def install
+              bin.install "etop"
+            end
+
+            test do
+              output = shell_output("#{bin}/etop --dump-once")
+              assert_match(/\S+/, output)
+            end
+          end
+          EOF
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/etop.rb
+          if git -C tap diff --cached --quiet; then
+            echo "Homebrew tap already up to date."
+            exit 0
+          fi
+          git -C tap commit -m "chore(release): bump etop to ${RELEASE_TAG}"
+          git -C tap push origin main

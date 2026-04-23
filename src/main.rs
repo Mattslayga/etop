@@ -1,7 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::VecDeque,
-    io::{self, BufRead, BufReader},
+    fs,
+    io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
     thread,
@@ -82,11 +84,176 @@ struct SamplerRuntime {
     reader: thread::JoinHandle<()>,
 }
 
-fn main() -> io::Result<()> {
-    let dump_once = std::env::args().any(|a| a == "--dump-once");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliMode {
+    Tui,
+    DumpOnce,
+    Help,
+    Update,
+    Version,
+}
 
-    if dump_once {
-        match fetch_snapshot() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallChannel {
+    Homebrew,
+    LocalBin,
+    Unknown,
+}
+
+fn parse_cli_args<I, S>(args: I) -> Result<CliMode, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut mode = CliMode::Tui;
+
+    for arg in args.into_iter().skip(1) {
+        match arg.as_ref() {
+            "--dump-once" => {
+                if mode != CliMode::Tui {
+                    return Err("`--dump-once` cannot be combined with other modes".to_string());
+                }
+                mode = CliMode::DumpOnce;
+            }
+            "-h" | "--help" | "help" => {
+                if mode != CliMode::Tui {
+                    return Err("`--help` cannot be combined with other modes".to_string());
+                }
+                mode = CliMode::Help;
+            }
+            "update" | "upgrade" => {
+                if mode != CliMode::Tui {
+                    return Err("`update` cannot be combined with other modes".to_string());
+                }
+                mode = CliMode::Update;
+            }
+            "-V" | "--version" | "version" => {
+                if mode != CliMode::Tui {
+                    return Err("`--version` cannot be combined with other modes".to_string());
+                }
+                mode = CliMode::Version;
+            }
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+
+    Ok(mode)
+}
+
+fn print_help(mut out: impl Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "\
+etop {}
+Local-only macOS TUI process viewer focused on power usage and energy impact.
+
+USAGE:
+  etop [OPTIONS]
+  etop <COMMAND>
+
+OPTIONS:
+  --dump-once      Print one parsed `top` snapshot and exit
+  -h, --help       Show this help text
+  -V, --version    Show the current etop version
+
+COMMANDS:
+  update, upgrade  Print the recommended update path for this installation
+
+KEY CONTROLS:
+  q                quit
+  j/k or ↑/↓       move selection
+  g/G              jump to top/bottom
+  f                start filter input
+  d                clear active filter
+  p                pause or unpause refresh
+  s                cycle process sort
+  r                cycle pinned-history range
+  Enter            pin or unpin the selected process
+  m                open graph-threshold settings
+
+INSTALL:
+  Homebrew         brew install Mattslayga/etop/etop
+  Update           brew update && brew upgrade etop
+  Manual           review install.sh, then run it locally
+
+NOTES:
+  - etop is macOS-specific because it uses macOS `top` power semantics.
+  - Published release artifacts currently target Apple Silicon macOS only.
+",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn detect_install_channel() -> InstallChannel {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return InstallChannel::Unknown,
+    };
+    let resolved = fs::canonicalize(&exe).unwrap_or(exe);
+    let path = resolved.to_string_lossy();
+
+    if path.starts_with("/opt/homebrew/Cellar/")
+        || path.starts_with("/opt/homebrew/bin/")
+        || path.starts_with("/usr/local/Cellar/")
+        || path.starts_with("/usr/local/bin/")
+    {
+        InstallChannel::Homebrew
+    } else if path.contains("/.local/bin/") || path.ends_with("/.local/bin/etop") {
+        InstallChannel::LocalBin
+    } else {
+        InstallChannel::Unknown
+    }
+}
+
+fn install_path_hint() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok())
+}
+
+fn print_update_help(mut out: impl Write) -> io::Result<()> {
+    let channel = detect_install_channel();
+    let exe = install_path_hint();
+
+    writeln!(out, "etop {}", env!("CARGO_PKG_VERSION"))?;
+    if let Some(path) = exe.as_ref() {
+        writeln!(out, "Current binary: {}", path.display())?;
+    }
+    writeln!(out)?;
+
+    match channel {
+        InstallChannel::Homebrew => {
+            writeln!(out, "This looks like a Homebrew install.")?;
+            writeln!(out, "Recommended update:")?;
+            writeln!(out, "  brew update && brew upgrade etop")?;
+            writeln!(out)?;
+            writeln!(out, "If the tap formula looks stale:")?;
+            writeln!(out, "  brew untap Mattslayga/etop")?;
+            writeln!(out, "  brew tap Mattslayga/etop")?;
+            writeln!(out, "  brew reinstall etop")?;
+        }
+        InstallChannel::LocalBin => {
+            writeln!(out, "This looks like a manual ~/.local/bin install.")?;
+            writeln!(out, "Recommended update:")?;
+            writeln!(out, "  sh install.sh")?;
+            writeln!(out)?;
+            writeln!(out, "Or install a specific release:")?;
+            writeln!(out, "  sh install.sh --version vX.Y.Z")?;
+        }
+        InstallChannel::Unknown => {
+            writeln!(out, "Unable to infer the install method from the current binary path.")?;
+            writeln!(out, "Recommended update paths:")?;
+            writeln!(out, "  Homebrew: brew update && brew upgrade etop")?;
+            writeln!(out, "  Manual:   sh install.sh")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    match parse_cli_args(std::env::args()) {
+        Ok(CliMode::DumpOnce) => match fetch_snapshot() {
             Ok(snapshot) => {
                 let mut rows = snapshot.rows;
                 rows.sort_by(|a, b| {
@@ -97,16 +264,32 @@ fn main() -> io::Result<()> {
                 for row in rows.into_iter().take(10) {
                     println!("{:>6}  {:<48}  {:>8}", row.pid, row.process, row.power);
                 }
-                return Ok(());
+                Ok(())
             }
             Err(err) => {
                 eprintln!("etop: failed to fetch top data: {err}");
-                return Err(io::Error::other(format!("failed to fetch top data: {err}")));
+                Err(io::Error::other(format!("failed to fetch top data: {err}")))
             }
+        },
+        Ok(CliMode::Help) => {
+            print_help(io::stdout())?;
+            Ok(())
+        }
+        Ok(CliMode::Update) => {
+            print_update_help(io::stdout())?;
+            Ok(())
+        }
+        Ok(CliMode::Version) => {
+            println!("etop {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Ok(CliMode::Tui) => run_tui(),
+        Err(err) => {
+            eprintln!("etop: {err}");
+            eprintln!("Try `etop --help`.");
+            Err(io::Error::new(io::ErrorKind::InvalidInput, err))
         }
     }
-
-    run_tui()
 }
 
 fn run_tui() -> io::Result<()> {
@@ -697,30 +880,96 @@ struct TableLayout {
     show_pid: bool,
     show_avg: bool,
     show_peak: bool,
+    process_width: u16,
     trend_width: u16,
 }
 
-fn compute_process_col_width(panel_width: u16) -> u16 {
-    let inner = panel_width.saturating_sub(4);
-    if inner < 40 {
-        20
-    } else if inner < 80 {
-        28
-    } else if inner < 120 {
-        40
+fn process_column_min_width(inner_width: u16) -> u16 {
+    if inner_width < 44 {
+        12
+    } else if inner_width < 72 {
+        16
     } else {
-        52
+        18
     }
 }
 
 impl TableLayout {
     fn for_processes(width: u16) -> Self {
-        Self {
-            show_pid: width >= 74,
-            show_avg: width >= 58,
-            show_peak: width >= 70,
-            trend_width: trend_column_width(width),
+        let inner_width = width.saturating_sub(2);
+        let process_width = process_column_min_width(inner_width);
+        let mut layout = Self {
+            show_pid: true,
+            show_avg: true,
+            show_peak: true,
+            process_width,
+            trend_width: trend_column_width(inner_width),
+        };
+
+        while layout.total_width() > inner_width {
+            layout = if layout.trend_width > 18 {
+                Self {
+                    trend_width: 18,
+                    ..layout
+                }
+            } else if layout.trend_width > 14 {
+                Self {
+                    trend_width: 14,
+                    ..layout
+                }
+            } else if layout.trend_width > 10 {
+                Self {
+                    trend_width: 10,
+                    ..layout
+                }
+            } else if layout.trend_width > 0 {
+                Self {
+                    trend_width: 0,
+                    ..layout
+                }
+            } else if layout.show_peak {
+                Self {
+                    show_peak: false,
+                    ..layout
+                }
+            } else if layout.show_avg {
+                Self {
+                    show_avg: false,
+                    ..layout
+                }
+            } else if layout.show_pid {
+                Self {
+                    show_pid: false,
+                    ..layout
+                }
+            } else {
+                break;
+            };
         }
+
+        layout
+    }
+
+    fn total_width(self) -> u16 {
+        let mut columns = 3u16;
+        let mut width = 1 + self.process_width + 8;
+        if self.show_pid {
+            columns += 1;
+            width += 7;
+        }
+        if self.show_avg {
+            columns += 1;
+            width += 8;
+        }
+        if self.show_peak {
+            columns += 1;
+            width += 8;
+        }
+        if self.trend_width > 0 {
+            columns += 1;
+            width += self.trend_width;
+        }
+        width + columns.saturating_sub(1)
     }
 }
 
@@ -731,6 +980,8 @@ fn trend_column_width(panel_width: u16) -> u16 {
         18
     } else if panel_width >= 90 {
         14
+    } else if panel_width >= 78 {
+        10
     } else {
         0
     }
@@ -1243,13 +1494,12 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     let table_block = panel_block();
 
-    let process_col_width = compute_process_col_width(rows_area.width);
     let mut constraints: Vec<Constraint> = Vec::with_capacity(7);
     constraints.push(Constraint::Length(1));
     if layout.show_pid {
         constraints.push(Constraint::Length(7));
     }
-    constraints.push(Constraint::Min(process_col_width));
+    constraints.push(Constraint::Min(layout.process_width));
     constraints.push(Constraint::Length(now_width));
     if layout.show_avg {
         constraints.push(Constraint::Length(avg_width));
@@ -1558,6 +1808,50 @@ mod tests {
             power: format!("{power_num:.1}"),
             power_num,
         }
+    }
+
+    #[test]
+    fn cli_parser_defaults_to_tui() {
+        assert_eq!(parse_cli_args(["etop"]).unwrap(), CliMode::Tui);
+    }
+
+    #[test]
+    fn cli_parser_accepts_help_version_and_dump_once() {
+        assert_eq!(parse_cli_args(["etop", "--help"]).unwrap(), CliMode::Help);
+        assert_eq!(
+            parse_cli_args(["etop", "--version"]).unwrap(),
+            CliMode::Version
+        );
+        assert_eq!(
+            parse_cli_args(["etop", "--dump-once"]).unwrap(),
+            CliMode::DumpOnce
+        );
+        assert_eq!(parse_cli_args(["etop", "update"]).unwrap(), CliMode::Update);
+        assert_eq!(parse_cli_args(["etop", "upgrade"]).unwrap(), CliMode::Update);
+    }
+
+    #[test]
+    fn cli_parser_rejects_unknown_or_conflicting_args() {
+        assert!(parse_cli_args(["etop", "--wat"]).is_err());
+        assert!(parse_cli_args(["etop", "--dump-once", "--help"]).is_err());
+    }
+
+    #[test]
+    fn process_table_keeps_pid_avg_and_peak_visible_on_moderate_widths() {
+        let layout = TableLayout::for_processes(60);
+
+        assert!(layout.show_pid);
+        assert!(layout.show_avg);
+        assert!(layout.show_peak);
+    }
+
+    #[test]
+    fn process_table_drops_trend_before_metrics_on_narrower_widths() {
+        let layout = TableLayout::for_processes(48);
+
+        assert_eq!(layout.trend_width, 0);
+        assert!(layout.show_pid);
+        assert!(layout.show_avg);
     }
 
     #[test]
