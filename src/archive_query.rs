@@ -76,12 +76,11 @@ where
         return Vec::new();
     }
 
-    let Some(window_end_exclusive) = anchored_window_end_exclusive(archive, range) else {
+    let Some(window_end_bucket) = anchored_window_end_bucket(archive, range, points) else {
         return vec![None; points];
     };
 
-    let window_secs = range.window_secs().max(1);
-    let window_start = window_end_exclusive.saturating_sub(window_secs);
+    let window_start_bucket = window_end_bucket.saturating_sub(points as u64);
 
     #[derive(Default)]
     struct GraphBin {
@@ -92,7 +91,7 @@ where
 
     #[derive(Clone, Copy)]
     struct PrevPoint {
-        bucket_start_secs: u64,
+        display_bucket: u64,
         bin_idx: usize,
     }
 
@@ -102,24 +101,25 @@ where
 
     let mut prev: Option<PrevPoint> = None;
     for tier_sample in tier_for_range(archive, range) {
-        let bucket_start = tier_sample.bucket_start_secs;
-        if bucket_start < window_start || bucket_start >= window_end_exclusive {
+        let display_bucket = display_bucket_for_sample(
+            tier_sample.bucket_start_secs,
+            range.bucket_secs(),
+            range.window_secs(),
+            points,
+        );
+
+        if display_bucket < window_start_bucket || display_bucket >= window_end_bucket {
             continue;
         }
 
         let avg = sample_value(tier_sample);
-
-        let mut target_idx = time_to_bin_idx(bucket_start, window_start, window_secs, points);
+        let mut target_idx = (display_bucket - window_start_bucket) as usize;
 
         if let Some(prev_point) = prev {
             target_idx = target_idx.max(prev_point.bin_idx);
 
-            let contiguous = bucket_start
-                == prev_point
-                    .bucket_start_secs
-                    .saturating_add(range.bucket_secs());
-
-            if !contiguous {
+            let bucket_gap = display_bucket > prev_point.display_bucket.saturating_add(1);
+            if tier_sample.gap_before || bucket_gap {
                 let gap_idx = target_idx.saturating_sub(1).min(points - 1);
                 bins[gap_idx].force_gap = true;
 
@@ -132,7 +132,7 @@ where
         bins[target_idx].sum += avg;
         bins[target_idx].count = bins[target_idx].count.saturating_add(1);
         prev = Some(PrevPoint {
-            bucket_start_secs: bucket_start,
+            display_bucket,
             bin_idx: target_idx,
         });
     }
@@ -150,10 +150,22 @@ where
         .collect()
 }
 
-fn anchored_window_end_exclusive(archive: &ArchiveState, range: ArchiveGraphRange) -> Option<u64> {
+fn anchored_window_end_bucket(
+    archive: &ArchiveState,
+    range: ArchiveGraphRange,
+    points: usize,
+) -> Option<u64> {
     tier_for_range(archive, range)
         .back()
-        .map(|sample| sample.bucket_start_secs.saturating_add(range.bucket_secs()))
+        .map(|sample| {
+            display_bucket_for_sample(
+                sample.bucket_start_secs,
+                range.bucket_secs(),
+                range.window_secs(),
+                points,
+            )
+            .saturating_add(1)
+        })
 }
 
 fn tier_for_range(
@@ -167,22 +179,22 @@ fn tier_for_range(
     }
 }
 
-fn time_to_bin_idx(
-    timestamp_secs: u64,
-    window_start_secs: u64,
+fn display_bucket_for_sample(
+    bucket_start_secs: u64,
+    sample_bucket_secs: u64,
     window_secs: u64,
     bins: usize,
-) -> usize {
+) -> u64 {
     if bins == 0 || window_secs == 0 {
         return 0;
     }
 
-    let offset = timestamp_secs
-        .saturating_sub(window_start_secs)
-        .min(window_secs.saturating_sub(1));
-
-    let idx = ((u128::from(offset) * bins as u128) / u128::from(window_secs)) as usize;
-    idx.min(bins.saturating_sub(1))
+    let midpoint_numer = u128::from(bucket_start_secs)
+        .saturating_mul(2)
+        .saturating_add(u128::from(sample_bucket_secs));
+    let idx =
+        (midpoint_numer.saturating_mul(bins as u128)) / u128::from(window_secs).saturating_mul(2);
+    idx.min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -200,12 +212,14 @@ mod tests {
                     sample_count: 2,
                     total_power_sum: 20.0,
                     groups: Vec::new(),
+                    gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 1_700,
                     sample_count: 1,
                     total_power_sum: 30.0,
                     groups: Vec::new(),
+                    gap_before: false,
                 },
             ]),
             ..ArchiveState::default()
@@ -228,12 +242,14 @@ mod tests {
                     sample_count: 1,
                     total_power_sum: 10.0,
                     groups: Vec::new(),
+                    gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 100,
                     sample_count: 1,
                     total_power_sum: 12.0,
                     groups: Vec::new(),
+                    gap_before: true,
                 },
             ]),
             ..ArchiveState::default()
@@ -255,12 +271,14 @@ mod tests {
                     sample_count: 1,
                     total_power_sum: 10.0,
                     groups: Vec::new(),
+                    gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 10_790,
                     sample_count: 2,
                     total_power_sum: 30.0,
                     groups: Vec::new(),
+                    gap_before: false,
                 },
             ]),
             ..ArchiveState::default()
@@ -285,6 +303,7 @@ mod tests {
                         name: "Safari".to_string(),
                         power_sum: 12.0,
                     }],
+                    gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 1_700,
@@ -294,6 +313,7 @@ mod tests {
                         name: "Mail".to_string(),
                         power_sum: 4.0,
                     }],
+                    gap_before: false,
                 },
             ]),
             ..ArchiveState::default()
@@ -320,6 +340,7 @@ mod tests {
                         name: "Safari".to_string(),
                         power_sum: 7.0,
                     }],
+                    gap_before: false,
                 },
                 TierSample {
                     bucket_start_secs: 100,
@@ -329,6 +350,7 @@ mod tests {
                         name: "Safari".to_string(),
                         power_sum: 9.0,
                     }],
+                    gap_before: true,
                 },
             ]),
             ..ArchiveState::default()
@@ -340,5 +362,159 @@ mod tests {
         assert_eq!(samples.len(), 8);
         assert_eq!(samples[0], None);
         assert_eq!(samples[1], Some(9.0));
+    }
+
+    #[test]
+    fn graph_samples_for_range_respects_explicit_gap_before_adjacent_bucket() {
+        let archive = ArchiveState {
+            agg_10s: VecDeque::from(vec![
+                TierSample {
+                    bucket_start_secs: 100,
+                    sample_count: 1,
+                    total_power_sum: 10.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: 110,
+                    sample_count: 1,
+                    total_power_sum: 12.0,
+                    groups: Vec::new(),
+                    gap_before: true,
+                },
+            ]),
+            ..ArchiveState::default()
+        };
+
+        let samples = graph_samples_for_range(&archive, ArchiveGraphRange::Hours3, 100);
+
+        assert_eq!(samples[1], None);
+        assert_eq!(samples[2], Some(12.0));
+    }
+
+    #[test]
+    fn graph_samples_for_range_keeps_closed_columns_stable_within_display_bucket() {
+        let width = 90;
+        let base = 1_800_000;
+
+        let before = ArchiveState {
+            raw_2s: VecDeque::from(vec![
+                TierSample {
+                    bucket_start_secs: base + 90,
+                    sample_count: 1,
+                    total_power_sum: 4.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 100,
+                    sample_count: 1,
+                    total_power_sum: 10.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 102,
+                    sample_count: 1,
+                    total_power_sum: 20.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 104,
+                    sample_count: 1,
+                    total_power_sum: 30.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+            ]),
+            ..ArchiveState::default()
+        };
+
+        let mut after = before.clone();
+        after.raw_2s.push_back(TierSample {
+            bucket_start_secs: base + 106,
+            sample_count: 1,
+            total_power_sum: 40.0,
+            groups: Vec::new(),
+            gap_before: false,
+        });
+
+        let before_samples = graph_samples_for_range(&before, ArchiveGraphRange::Minutes30, width);
+        let after_samples = graph_samples_for_range(&after, ArchiveGraphRange::Minutes30, width);
+
+        let diffs: Vec<usize> = before_samples
+            .iter()
+            .zip(after_samples.iter())
+            .enumerate()
+            .filter_map(|(idx, (before, after))| (before != after).then_some(idx))
+            .collect();
+
+        let current_idx = before_samples
+            .iter()
+            .rposition(|value| value.is_some())
+            .expect("expected active display bucket");
+        assert_eq!(diffs, vec![current_idx]);
+    }
+
+    #[test]
+    fn graph_samples_for_range_only_shifts_when_crossing_display_bucket_boundary() {
+        let width = 90;
+        let base = 1_800_000;
+
+        let before = ArchiveState {
+            raw_2s: VecDeque::from(vec![
+                TierSample {
+                    bucket_start_secs: base + 90,
+                    sample_count: 1,
+                    total_power_sum: 4.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 100,
+                    sample_count: 1,
+                    total_power_sum: 10.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 102,
+                    sample_count: 1,
+                    total_power_sum: 20.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 104,
+                    sample_count: 1,
+                    total_power_sum: 30.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+                TierSample {
+                    bucket_start_secs: base + 106,
+                    sample_count: 1,
+                    total_power_sum: 40.0,
+                    groups: Vec::new(),
+                    gap_before: false,
+                },
+            ]),
+            ..ArchiveState::default()
+        };
+
+        let mut after = before.clone();
+        after.raw_2s.push_back(TierSample {
+            bucket_start_secs: base + 110,
+            sample_count: 1,
+            total_power_sum: 50.0,
+            groups: Vec::new(),
+            gap_before: false,
+        });
+
+        let before_samples = graph_samples_for_range(&before, ArchiveGraphRange::Minutes30, width);
+        let after_samples = graph_samples_for_range(&after, ArchiveGraphRange::Minutes30, width);
+
+        assert_eq!(&after_samples[..after_samples.len() - 1], &before_samples[1..]);
     }
 }

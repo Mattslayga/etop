@@ -8,7 +8,8 @@ use std::{
 };
 
 const CACHE_MAGIC: &[u8; 8] = b"ETOPCACH";
-const CACHE_VERSION: u16 = 2;
+const CACHE_VERSION_V2: u16 = 2;
+const CACHE_VERSION: u16 = 3;
 const CACHE_FILE_NAME: &str = "session-cache.v1.bin";
 const QUICK_HYDRATE_GAP_MULTIPLIER: u64 = 3;
 
@@ -52,6 +53,7 @@ pub struct TierSample {
     pub sample_count: u32,
     pub total_power_sum: f64,
     pub groups: Vec<GroupPowerSum>,
+    pub gap_before: bool,
 }
 
 impl TierSample {
@@ -59,12 +61,14 @@ impl TierSample {
         bucket_start_secs: u64,
         total_power: f64,
         groups: &[GroupPowerSum],
+        gap_before: bool,
     ) -> Self {
         Self {
             bucket_start_secs,
             sample_count: 1,
             total_power_sum: total_power,
             groups: groups.to_vec(),
+            gap_before,
         }
     }
 }
@@ -88,10 +92,10 @@ impl ArchiveState {
         I: IntoIterator<Item = (String, f64)>,
     {
         let groups = normalize_group_sums(grouped);
-        let can_merge_with_previous = self
+        let has_gap_from_previous = self
             .last_sample_unix_secs
-            .map(|previous| timestamp_secs.saturating_sub(previous) <= max_contiguous_gap_secs)
-            .unwrap_or(true);
+            .map(|previous| timestamp_secs.saturating_sub(previous) > max_contiguous_gap_secs)
+            .unwrap_or(false);
 
         upsert_aggregate_bucket(
             &mut self.raw_2s,
@@ -100,7 +104,7 @@ impl ArchiveState {
             timestamp_secs,
             total_power,
             &groups,
-            can_merge_with_previous,
+            has_gap_from_previous,
         );
 
         upsert_aggregate_bucket(
@@ -110,7 +114,7 @@ impl ArchiveState {
             timestamp_secs,
             total_power,
             &groups,
-            can_merge_with_previous,
+            has_gap_from_previous,
         );
 
         upsert_aggregate_bucket(
@@ -120,7 +124,7 @@ impl ArchiveState {
             timestamp_secs,
             total_power,
             &groups,
-            can_merge_with_previous,
+            has_gap_from_previous,
         );
 
         self.last_sample_unix_secs = Some(timestamp_secs);
@@ -388,7 +392,7 @@ fn upsert_aggregate_bucket(
     timestamp_secs: u64,
     total_power: f64,
     groups: &[GroupPowerSum],
-    can_merge_with_previous: bool,
+    has_gap_from_previous: bool,
 ) {
     // A long downtime may produce a new sample that lands in the same wall-clock bucket
     // as the last persisted sample. In that case we intentionally append a second bucket
@@ -400,7 +404,7 @@ fn upsert_aggregate_bucket(
         timestamp_secs.saturating_sub(timestamp_secs % bucket_secs)
     };
 
-    if can_merge_with_previous {
+    if !has_gap_from_previous {
         if let Some(last) = tier.back_mut() {
             if last.bucket_start_secs == bucket_start {
                 last.sample_count = last.sample_count.saturating_add(1);
@@ -411,10 +415,12 @@ fn upsert_aggregate_bucket(
         }
     }
 
+    let gap_before = has_gap_from_previous && !tier.is_empty();
     tier.push_back(TierSample::from_single_sample(
         bucket_start,
         total_power,
         groups,
+        gap_before,
     ));
     trim_to_capacity(tier, capacity);
 }
@@ -478,6 +484,7 @@ fn encode_tier<W: Write>(writer: &mut W, tier: &VecDeque<TierSample>) -> io::Res
             write_string(writer, &group.name)?;
             write_f64(writer, group.power_sum)?;
         }
+        write_bool(writer, sample.gap_before)?;
     }
 
     Ok(())
@@ -494,7 +501,7 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     }
 
     let version = read_u16(reader)?;
-    if version != CACHE_VERSION {
+    if version != CACHE_VERSION_V2 && version != CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported cache version: {version}"),
@@ -533,9 +540,9 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     }
 
     let mut archive = ArchiveState {
-        raw_2s: decode_tier(reader)?,
-        agg_10s: decode_tier(reader)?,
-        agg_60s: decode_tier(reader)?,
+        raw_2s: decode_tier(reader, version)?,
+        agg_10s: decode_tier(reader, version)?,
+        agg_60s: decode_tier(reader, version)?,
         last_sample_unix_secs,
     };
     archive.enforce_bounds();
@@ -549,7 +556,7 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     })
 }
 
-fn decode_tier<R: Read>(reader: &mut R) -> io::Result<VecDeque<TierSample>> {
+fn decode_tier<R: Read>(reader: &mut R, version: u16) -> io::Result<VecDeque<TierSample>> {
     let len = read_len(reader, MAX_TIER_SAMPLES, "tier samples")?;
     let mut tier = VecDeque::with_capacity(len);
 
@@ -567,11 +574,18 @@ fn decode_tier<R: Read>(reader: &mut R) -> io::Result<VecDeque<TierSample>> {
             });
         }
 
+        let gap_before = if version == CACHE_VERSION {
+            read_bool(reader)?
+        } else {
+            false
+        };
+
         tier.push_back(TierSample {
             bucket_start_secs,
             sample_count,
             total_power_sum,
             groups,
+            gap_before,
         });
     }
 
@@ -630,6 +644,10 @@ fn write_f64<W: Write>(writer: &mut W, value: f64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
+fn write_bool<W: Write>(writer: &mut W, value: bool) -> io::Result<()> {
+    writer.write_all(&[u8::from(value)])
+}
+
 fn read_u16<R: Read>(reader: &mut R) -> io::Result<u16> {
     let mut buf = [0u8; 2];
     reader.read_exact(&mut buf)?;
@@ -660,9 +678,71 @@ fn read_f64<R: Read>(reader: &mut R) -> io::Result<f64> {
     Ok(f64::from_le_bytes(buf))
 }
 
+fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    match buf[0] {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid bool value: {value}"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_session_cache_v2<W: Write>(cache: &SessionCache, writer: &mut W) -> io::Result<()> {
+        writer.write_all(CACHE_MAGIC)?;
+        write_u16(writer, CACHE_VERSION_V2)?;
+        write_u64(writer, cache.saved_at_unix_millis)?;
+        write_u64(writer, cache.last_tick)?;
+        write_u64(writer, cache.archive.last_sample_unix_secs.unwrap_or(0))?;
+
+        write_len(writer, cache.live_power_history.len())?;
+        for value in &cache.live_power_history {
+            write_f64(writer, *value)?;
+        }
+
+        write_len(writer, cache.live_snapshots.len())?;
+        for snapshot in &cache.live_snapshots {
+            write_u64(writer, snapshot.tick)?;
+            write_len(writer, snapshot.samples.len())?;
+
+            for sample in &snapshot.samples {
+                write_i32(writer, sample.pid)?;
+                write_string(writer, &sample.process)?;
+                write_f64(writer, sample.power)?;
+            }
+        }
+
+        encode_tier_v2(writer, &cache.archive.raw_2s)?;
+        encode_tier_v2(writer, &cache.archive.agg_10s)?;
+        encode_tier_v2(writer, &cache.archive.agg_60s)?;
+
+        Ok(())
+    }
+
+    fn encode_tier_v2<W: Write>(writer: &mut W, tier: &VecDeque<TierSample>) -> io::Result<()> {
+        write_len(writer, tier.len())?;
+
+        for sample in tier {
+            write_u64(writer, sample.bucket_start_secs)?;
+            write_u32(writer, sample.sample_count)?;
+            write_f64(writer, sample.total_power_sum)?;
+
+            write_len(writer, sample.groups.len())?;
+            for group in &sample.groups {
+                write_string(writer, &group.name)?;
+                write_f64(writer, group.power_sum)?;
+            }
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn session_cache_roundtrips_binary_format() {
@@ -714,6 +794,55 @@ mod tests {
 
         let mut bytes = Vec::new();
         encode_session_cache(&cache, &mut bytes).expect("encode should succeed");
+
+        let decoded = decode_session_cache(&mut bytes.as_slice()).expect("decode should succeed");
+        assert_eq!(decoded, cache);
+    }
+
+    #[test]
+    fn session_cache_decodes_v2_binary_format_with_gap_flags_defaulted() {
+        let cache = SessionCache {
+            saved_at_unix_millis: 123_456,
+            last_tick: 42,
+            live_power_history: vec![1.0, 2.5],
+            live_snapshots: vec![LiveSnapshot {
+                tick: 42,
+                samples: vec![LiveProcessSample {
+                    pid: 1,
+                    process: "Safari".to_string(),
+                    power: 5.0,
+                }],
+            }],
+            archive: ArchiveState {
+                raw_2s: VecDeque::from(vec![
+                    TierSample {
+                        bucket_start_secs: 100,
+                        sample_count: 1,
+                        total_power_sum: 10.0,
+                        groups: vec![GroupPowerSum {
+                            name: "Safari".to_string(),
+                            power_sum: 10.0,
+                        }],
+                        gap_before: false,
+                    },
+                    TierSample {
+                        bucket_start_secs: 108,
+                        sample_count: 1,
+                        total_power_sum: 12.0,
+                        groups: vec![GroupPowerSum {
+                            name: "Safari".to_string(),
+                            power_sum: 12.0,
+                        }],
+                        gap_before: false,
+                    },
+                ]),
+                last_sample_unix_secs: Some(108),
+                ..ArchiveState::default()
+            },
+        };
+
+        let mut bytes = Vec::new();
+        encode_session_cache_v2(&cache, &mut bytes).expect("v2 encode should succeed");
 
         let decoded = decode_session_cache(&mut bytes.as_slice()).expect("decode should succeed");
         assert_eq!(decoded, cache);
@@ -775,6 +904,8 @@ mod tests {
         assert_eq!(archive.agg_10s[1].bucket_start_secs, 100);
         assert_eq!(archive.agg_10s[0].sample_count, 1);
         assert_eq!(archive.agg_10s[1].sample_count, 1);
+        assert!(!archive.agg_10s[0].gap_before);
+        assert!(archive.agg_10s[1].gap_before);
     }
 
     #[test]
@@ -790,6 +921,23 @@ mod tests {
         assert_eq!(archive.agg_60s[1].bucket_start_secs, 120);
         assert_eq!(archive.agg_60s[0].sample_count, 1);
         assert_eq!(archive.agg_60s[1].sample_count, 1);
+        assert!(!archive.agg_60s[0].gap_before);
+        assert!(archive.agg_60s[1].gap_before);
+    }
+
+    #[test]
+    fn archive_marks_gap_before_adjacent_bucket_after_long_gap() {
+        let mut archive = ArchiveState::default();
+        let threshold = continuity_threshold_secs(Duration::from_secs(2));
+
+        archive.record_sample(100, threshold, 10.0, [("Safari".to_string(), 10.0)]);
+        archive.record_sample(115, threshold, 12.0, [("Safari".to_string(), 12.0)]);
+
+        assert_eq!(archive.agg_10s.len(), 2);
+        assert_eq!(archive.agg_10s[0].bucket_start_secs, 100);
+        assert_eq!(archive.agg_10s[1].bucket_start_secs, 110);
+        assert!(!archive.agg_10s[0].gap_before);
+        assert!(archive.agg_10s[1].gap_before);
     }
 
     #[test]
@@ -830,12 +978,14 @@ mod tests {
                         sample_count: 1,
                         total_power_sum: 10.0,
                         groups: Vec::new(),
+                        gap_before: false,
                     },
                     TierSample {
                         bucket_start_secs: 102,
                         sample_count: 1,
                         total_power_sum: 55_443_352.6,
                         groups: Vec::new(),
+                        gap_before: false,
                     },
                 ]),
                 ..ArchiveState::default()

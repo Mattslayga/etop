@@ -1925,6 +1925,7 @@ mod tests {
                     name: "Safari".to_string(),
                     power_sum: 18.0,
                 }],
+                gap_before: false,
             }]),
             ..persistence::ArchiveState::default()
         };

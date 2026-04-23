@@ -11,10 +11,7 @@ const COLOR_YELLOW: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const COLOR_ORANGE: Color = Color::Rgb(0xd1, 0x9a, 0x66);
 const COLOR_RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 
-const BRAILLE_5X5: [char; 25] = [
-    ' ', '⢀', '⢠', '⢰', '⢸', '⡀', '⣀', '⣠', '⣰', '⣸', '⡄', '⣄', '⣤', '⣴', '⣼', '⡆', '⣆', '⣦', '⣶',
-    '⣾', '⡇', '⣇', '⣧', '⣷', '⣿',
-];
+const BRAILLE_DOT_MASKS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraphRange {
@@ -215,6 +212,14 @@ fn graph_span_style(color: Option<Color>) -> Style {
     }
 }
 
+fn braille_char_from_bits(bits: u8) -> char {
+    if bits == 0 {
+        ' '
+    } else {
+        char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+    }
+}
+
 pub(crate) fn row_position_color(row_from_top: usize, height: usize) -> Color {
     if height <= 1 {
         return COLOR_GREEN;
@@ -234,6 +239,135 @@ pub(crate) fn row_position_color(row_from_top: usize, height: usize) -> Color {
     }
 }
 
+fn value_to_top_dot_row(value: f64, min: f64, max: f64, height: usize) -> Option<usize> {
+    let steps = value_to_vertical_steps(value, min, max, height);
+    if steps <= 0 {
+        return None;
+    }
+
+    let dot_height = height.saturating_mul(4);
+    Some(dot_height.saturating_sub(steps as usize))
+}
+
+fn mark_contour_top(contour_tops: &mut [Option<usize>], x: usize, y: usize) {
+    let Some(slot) = contour_tops.get_mut(x) else {
+        return;
+    };
+
+    match slot {
+        Some(current) => *current = (*current).min(y),
+        None => *slot = Some(y),
+    }
+}
+
+fn rasterize_segment_contour_tops(
+    contour_tops: &mut [Option<usize>],
+    start_x: usize,
+    start_y: usize,
+    end_x: usize,
+    end_y: usize,
+) {
+    let mut x0 = start_x as isize;
+    let mut y0 = start_y as isize;
+    let x1 = end_x as isize;
+    let y1 = end_y as isize;
+
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        mark_contour_top(contour_tops, x0 as usize, y0 as usize);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+
+        let err2 = err * 2;
+        if err2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if err2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn contour_tops_from_points(points: &[Option<usize>]) -> Vec<Option<usize>> {
+    let mut contour_tops = vec![None; points.len()];
+    let mut previous: Option<(usize, usize)> = None;
+
+    for (x, point) in points.iter().copied().enumerate() {
+        match point {
+            Some(y) => {
+                mark_contour_top(&mut contour_tops, x, y);
+
+                if let Some((prev_x, prev_y)) = previous
+                    && prev_x + 1 == x
+                {
+                    rasterize_segment_contour_tops(&mut contour_tops, prev_x, prev_y, x, y);
+                }
+
+                previous = Some((x, y));
+            }
+            None => previous = None,
+        }
+    }
+
+    contour_tops
+}
+
+fn braille_rows_from_contour_tops(
+    contour_tops: &[Option<usize>],
+    width: usize,
+    height: usize,
+) -> Vec<Vec<(char, Color)>> {
+    let mut rows = Vec::with_capacity(height);
+
+    for row_from_top in 0..height {
+        let row_color = row_position_color(row_from_top, height);
+        let dot_row_start = row_from_top * 4;
+
+        let mut line = Vec::with_capacity(width);
+        for col in 0..width {
+            let mut bits = 0u8;
+
+            for (dy, masks) in BRAILLE_DOT_MASKS.iter().enumerate() {
+                let dot_y = dot_row_start + dy;
+                let left_x = col * 2;
+                let right_x = left_x + 1;
+
+                if contour_tops
+                    .get(left_x)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|top_y| dot_y >= top_y)
+                {
+                    bits |= masks[0];
+                }
+
+                if contour_tops
+                    .get(right_x)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|top_y| dot_y >= top_y)
+                {
+                    bits |= masks[1];
+                }
+            }
+
+            line.push((braille_char_from_bits(bits), row_color));
+        }
+
+        rows.push(line);
+    }
+
+    rows
+}
+
 pub(crate) fn braille_history_cells_with_scale(
     values: &[f64],
     width: usize,
@@ -251,48 +385,12 @@ pub(crate) fn braille_history_cells_with_scale(
 
     let samples = history_viewport_samples(values, width);
 
-    let steps: Vec<i32> = samples
+    let points: Vec<Option<usize>> = samples
         .iter()
-        .map(|value| value_to_vertical_steps(*value, scale_min, scale_max, height))
+        .map(|value| value_to_top_dot_row(*value, scale_min, scale_max, height))
         .collect();
-
-    let mut rows = Vec::with_capacity(height);
-
-    for row_from_top in 0..height {
-        let row_from_bottom = height - 1 - row_from_top;
-        let row_base = (row_from_bottom * 4) as i32;
-        let row_color = row_position_color(row_from_top, height);
-
-        let mut line = Vec::with_capacity(width);
-        for col in 0..width {
-            let left_level = (steps[col * 2] - row_base).clamp(0, 4) as usize;
-            let right_level = (steps[col * 2 + 1] - row_base).clamp(0, 4) as usize;
-            line.push((BRAILLE_5X5[left_level * 5 + right_level], row_color));
-        }
-
-        rows.push(line);
-    }
-
-    let bottom_row_color = row_position_color(height - 1, height);
-    for col in 0..width {
-        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
-        if has_visible_segment {
-            continue;
-        }
-
-        let left_active = (samples[col * 2] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        let right_active = (samples[col * 2 + 1] - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON;
-        if !left_active && !right_active {
-            continue;
-        }
-
-        rows[height - 1][col] = (
-            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
-            bottom_row_color,
-        );
-    }
-
-    rows
+    let contour_tops = contour_tops_from_points(&points);
+    braille_rows_from_contour_tops(&contour_tops, width, height)
 }
 
 #[cfg(test)]
@@ -356,66 +454,14 @@ pub(crate) fn braille_history_cells_optional_with_scale(
 
     let samples = history_viewport_samples_optional(values, width);
 
-    let steps: Vec<Option<i32>> = samples
+    let points: Vec<Option<usize>> = samples
         .iter()
         .map(|value| {
-            value.map(|value| value_to_vertical_steps(value, scale_min, scale_max, height))
+            value.and_then(|value| value_to_top_dot_row(value, scale_min, scale_max, height))
         })
         .collect();
-
-    let mut rows = Vec::with_capacity(height);
-
-    for row_from_top in 0..height {
-        let row_from_bottom = height - 1 - row_from_top;
-        let row_base = (row_from_bottom * 4) as i32;
-        let row_color = row_position_color(row_from_top, height);
-
-        let mut line = Vec::with_capacity(width);
-        for col in 0..width {
-            let left_step = steps[col * 2];
-            let right_step = steps[col * 2 + 1];
-
-            if left_step.is_none() && right_step.is_none() {
-                line.push((' ', row_color));
-                continue;
-            }
-
-            let left_level = left_step.map(|step| (step - row_base).clamp(0, 4) as usize);
-            let right_level = right_step.map(|step| (step - row_base).clamp(0, 4) as usize);
-
-            line.push((
-                BRAILLE_5X5[left_level.unwrap_or(0) * 5 + right_level.unwrap_or(0)],
-                row_color,
-            ));
-        }
-
-        rows.push(line);
-    }
-
-    let bottom_row_color = row_position_color(height - 1, height);
-    for col in 0..width {
-        let has_visible_segment = rows.iter().any(|row| row[col].0 != ' ');
-        if has_visible_segment {
-            continue;
-        }
-
-        let left_active = samples[col * 2]
-            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
-            .unwrap_or(false);
-        let right_active = samples[col * 2 + 1]
-            .map(|value| (value - scale_min).max(0.0) > GRAPH_ACTIVITY_EPSILON)
-            .unwrap_or(false);
-        if !left_active && !right_active {
-            continue;
-        }
-
-        rows[height - 1][col] = (
-            BRAILLE_5X5[usize::from(left_active) * 5 + usize::from(right_active)],
-            bottom_row_color,
-        );
-    }
-
-    rows
+    let contour_tops = contour_tops_from_points(&points);
+    braille_rows_from_contour_tops(&contour_tops, width, height)
 }
 
 pub(crate) fn braille_history_lines_optional_with_scale(
@@ -480,6 +526,43 @@ mod tests {
             .filter(|span| span.content.chars().any(|ch| ch != ' '))
             .filter_map(|span| span.style.fg)
             .collect()
+    }
+
+    fn occupied_dot_columns(rows: &[String]) -> Vec<Vec<usize>> {
+        let height = rows.len();
+        if height == 0 {
+            return Vec::new();
+        }
+
+        let width = rows[0].chars().count();
+        let mut columns = vec![Vec::new(); width * 2];
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            for (col_idx, ch) in row.chars().enumerate() {
+                let bits = if ch == ' ' {
+                    0
+                } else {
+                    (ch as u32).saturating_sub(0x2800) as u8
+                };
+
+                for (dy, masks) in BRAILLE_DOT_MASKS.iter().enumerate() {
+                    let dot_y = row_idx * 4 + dy;
+                    if bits & masks[0] != 0 {
+                        columns[col_idx * 2].push(dot_y);
+                    }
+                    if bits & masks[1] != 0 {
+                        columns[col_idx * 2 + 1].push(dot_y);
+                    }
+                }
+            }
+        }
+
+        for dots in &mut columns {
+            dots.sort_unstable();
+            dots.dedup();
+        }
+
+        columns
     }
 
     #[test]
@@ -569,6 +652,30 @@ mod tests {
     fn braille_history_rows_single_row_uses_lookup_mapping() {
         let rows = braille_history_rows(&[10.0], 1, 1);
         assert_eq!(rows, vec!["⢰".to_string()]);
+    }
+
+    #[test]
+    fn braille_history_rows_rasterize_continuous_segments_across_cell_boundaries() {
+        let rows = braille_history_rows(&[80.0, 5.0, 80.0, 5.0], 2, 8);
+        let dot_columns = occupied_dot_columns(&rows);
+
+        assert!(dot_columns.iter().all(|column| !column.is_empty()));
+    }
+
+    #[test]
+    fn optional_braille_history_rows_break_segments_on_none_samples() {
+        let samples = vec![Some(80.0), Some(80.0), None, Some(80.0)];
+        let (scale_min, scale_max) = graph_scale_bounds_optional(&samples);
+        let rows = braille_history_cells_optional_with_scale(&samples, 2, 8, scale_min, scale_max)
+            .into_iter()
+            .map(|row| row.into_iter().map(|(ch, _)| ch).collect::<String>())
+            .collect::<Vec<_>>();
+        let dot_columns = occupied_dot_columns(&rows);
+
+        assert!(!dot_columns[0].is_empty());
+        assert!(!dot_columns[1].is_empty());
+        assert!(dot_columns[2].is_empty());
+        assert!(!dot_columns[3].is_empty());
     }
 
     #[test]
