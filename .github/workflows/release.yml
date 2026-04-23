@@ -14,6 +14,7 @@ jobs:
     runs-on: macos-14
     env:
       ASSET_NAME: etop-${{ github.ref_name }}-macos-aarch64.tar.gz
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
     steps:
       - name: Checkout
@@ -45,9 +46,8 @@ jobs:
           generate_release_notes: true
 
       - name: Update Homebrew tap
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPO: Mattslayga/homebrew-etop
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_SHA256: ${{ steps.asset.outputs.sha256 }}
