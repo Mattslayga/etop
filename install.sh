@@ -58,7 +58,7 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-ASSET="etop-${VERSION}-macos-aarch64.tar.gz"
+ASSET="etop-${VERSION}-macos-arm64.tar.gz"
 URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${ASSET}"
 
 tmpdir="$(mktemp -d)"

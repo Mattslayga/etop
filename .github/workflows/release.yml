@@ -13,7 +13,7 @@ jobs:
     name: macOS Apple Silicon release
     runs-on: macos-14
     env:
-      ASSET_NAME: etop-${{ github.ref_name }}-macos-aarch64.tar.gz
+      ASSET_NAME: etop-${{ github.ref_name }}-macos-arm64.tar.gz
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
     steps:
@@ -53,12 +53,14 @@ jobs:
           RELEASE_SHA256: ${{ steps.asset.outputs.sha256 }}
         run: |
           set -eu
+          formula_version="${RELEASE_TAG#v}"
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
           cat > tap/Formula/etop.rb <<EOF
           class Etop < Formula
             desc "Local-only macOS TUI process viewer focused on power usage and energy impact"
             homepage "https://github.com/Mattslayga/etop"
-            url "https://github.com/Mattslayga/etop/releases/download/${RELEASE_TAG}/etop-${RELEASE_TAG}-macos-aarch64.tar.gz"
+            url "https://github.com/Mattslayga/etop/releases/download/${RELEASE_TAG}/etop-${RELEASE_TAG}-macos-arm64.tar.gz"
+            version "${formula_version}"
             sha256 "${RELEASE_SHA256}"
             license "MIT"
 

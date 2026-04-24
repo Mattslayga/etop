@@ -124,7 +124,7 @@ sh install-etop.sh --version vX.Y.Z
 ```bash
 # replace vX.Y.Z
 curl -L -o etop.tar.gz \
-  https://github.com/Mattslayga/etop/releases/download/vX.Y.Z/etop-vX.Y.Z-macos-aarch64.tar.gz
+  https://github.com/Mattslayga/etop/releases/download/vX.Y.Z/etop-vX.Y.Z-macos-arm64.tar.gz
 
 tar -xzf etop.tar.gz
 ./etop
