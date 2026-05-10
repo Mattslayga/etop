@@ -241,7 +241,10 @@ fn print_update_help(mut out: impl Write) -> io::Result<()> {
             writeln!(out, "  sh install.sh --version vX.Y.Z")?;
         }
         InstallChannel::Unknown => {
-            writeln!(out, "Unable to infer the install method from the current binary path.")?;
+            writeln!(
+                out,
+                "Unable to infer the install method from the current binary path."
+            )?;
             writeln!(out, "Recommended update paths:")?;
             writeln!(out, "  Homebrew: brew update && brew upgrade etop")?;
             writeln!(out, "  Manual:   sh install.sh")?;
@@ -843,7 +846,30 @@ fn spectrum_band_color(power: f64, thresholds: &GraphHeatSettings) -> Color {
 
 const PIN_MARKER: &str = "▍";
 
-fn pin_marker_cell(is_pinned: bool) -> Cell<'static> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerSignal {
+    None,
+    Spike,
+    Sustained,
+    Cooling,
+}
+
+fn power_signal(current: f64, avg: f64, peak: f64, thresholds: &GraphHeatSettings) -> PowerSignal {
+    if current >= thresholds.orange_start && avg < thresholds.yellow_start {
+        PowerSignal::Spike
+    } else if current >= thresholds.yellow_start && avg >= thresholds.yellow_start {
+        PowerSignal::Sustained
+    } else if current < thresholds.yellow_start
+        && avg >= thresholds.yellow_start
+        && peak >= thresholds.orange_start
+    {
+        PowerSignal::Cooling
+    } else {
+        PowerSignal::None
+    }
+}
+
+fn marker_cell(is_pinned: bool, signal: PowerSignal) -> Cell<'static> {
     if is_pinned {
         Cell::from(Span::styled(
             PIN_MARKER,
@@ -852,7 +878,25 @@ fn pin_marker_cell(is_pinned: bool) -> Cell<'static> {
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
-        Cell::from(" ")
+        match signal {
+            PowerSignal::None => Cell::from(" "),
+            PowerSignal::Spike => Cell::from(Span::styled(
+                "^",
+                Style::default()
+                    .fg(COLOR_ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            PowerSignal::Sustained => Cell::from(Span::styled(
+                "!",
+                Style::default().fg(COLOR_RED).add_modifier(Modifier::BOLD),
+            )),
+            PowerSignal::Cooling => Cell::from(Span::styled(
+                "v",
+                Style::default()
+                    .fg(COLOR_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        }
     }
 }
 
@@ -1068,15 +1112,35 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         let graph_width = graph_inner.width as usize;
         let graph_height = graph_inner.height as usize;
 
-        let graph_samples = app.main_graph_live_samples_for_width(graph_width);
-        let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
-        let graph_lines = braille_history_lines_with_scale(
-            &graph_samples,
-            graph_width,
-            graph_height,
-            scale_min,
-            scale_max,
-        );
+        let (graph_lines, scale_min, scale_max) =
+            if let Some(archive_samples) = app.main_graph_archive_samples_for_width(graph_width) {
+                let (scale_min, scale_max) = graph_scale_bounds_optional(&archive_samples);
+                (
+                    braille_history_lines_optional_with_scale(
+                        &archive_samples,
+                        graph_width,
+                        graph_height,
+                        scale_min,
+                        scale_max,
+                    ),
+                    scale_min,
+                    scale_max,
+                )
+            } else {
+                let graph_samples = app.main_graph_live_samples_for_width(graph_width);
+                let (scale_min, scale_max) = app.graph_scale_bounds_for_viewport(&graph_samples);
+                (
+                    braille_history_lines_with_scale(
+                        &graph_samples,
+                        graph_width,
+                        graph_height,
+                        scale_min,
+                        scale_max,
+                    ),
+                    scale_min,
+                    scale_max,
+                )
+            };
         let mut graph_block = panel_block();
         if let Some(error) = app.last_error.as_deref() {
             graph_block = graph_block.title_bottom(Line::from(Span::styled(
@@ -1098,6 +1162,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         if !controls_blocked && !filter_input_active {
             let graph_top_controls = vec![
                 action_chip_line("menu", "m"),
+                action_chip_line("range", "r"),
                 action_chip_line("quit", "q"),
                 action_chip_line(if app.paused { "unpause" } else { "pause" }, "p"),
             ];
@@ -1136,6 +1201,10 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             );
         }
 
+        let range_chip: Vec<Span<'static>> = vec![Span::styled(
+            format!("range {}", app.graph_range.label()),
+            Style::default().fg(COLOR_MUTED),
+        )];
         let power_chip: Vec<Span<'static>> = vec![
             Span::styled("power ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
@@ -1147,7 +1216,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             format!("{:.0}–{:.0}", scale_min, scale_max),
             Style::default().fg(COLOR_MUTED),
         )];
-        let right_chips = vec![power_chip, scale_chip];
+        let right_chips = vec![range_chip, power_chip, scale_chip];
         let right_edge = graph_area.x + graph_area.width.saturating_sub(1);
         draw_chips_on_border_right(
             frame.buffer_mut(),
@@ -1411,8 +1480,9 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
                 .map(|pin| pin.pid == row.key.pid && pin.process == row.key.process)
                 .unwrap_or(false);
 
+            let signal = power_signal(row.current, row.avg, row.peak, &graph_heat);
             let mut cells: Vec<Cell<'static>> = Vec::with_capacity(7);
-            cells.push(pin_marker_cell(is_pinned_row));
+            cells.push(marker_cell(is_pinned_row, signal));
             if layout.show_pid {
                 cells.push(Cell::from(row.key.pid.to_string()));
             }
@@ -1827,7 +1897,10 @@ mod tests {
             CliMode::DumpOnce
         );
         assert_eq!(parse_cli_args(["etop", "update"]).unwrap(), CliMode::Update);
-        assert_eq!(parse_cli_args(["etop", "upgrade"]).unwrap(), CliMode::Update);
+        assert_eq!(
+            parse_cli_args(["etop", "upgrade"]).unwrap(),
+            CliMode::Update
+        );
     }
 
     #[test]
@@ -1913,6 +1986,26 @@ mod tests {
         assert_eq!(spectrum_band_color(25.0, &settings), COLOR_YELLOW);
         assert_eq!(spectrum_band_color(50.0, &settings), COLOR_ORANGE);
         assert_eq!(spectrum_band_color(70.0, &settings), COLOR_RED);
+    }
+
+    #[test]
+    fn power_signal_classifies_spike_sustained_and_cooling() {
+        let settings = GraphHeatSettings {
+            yellow_start: 20.0,
+            orange_start: 40.0,
+            red_start: 80.0,
+        };
+
+        assert_eq!(power_signal(45.0, 5.0, 45.0, &settings), PowerSignal::Spike);
+        assert_eq!(
+            power_signal(30.0, 25.0, 45.0, &settings),
+            PowerSignal::Sustained
+        );
+        assert_eq!(
+            power_signal(5.0, 25.0, 45.0, &settings),
+            PowerSignal::Cooling
+        );
+        assert_eq!(power_signal(5.0, 5.0, 10.0, &settings), PowerSignal::None);
     }
 
     fn key_press(ch: char) -> KeyEvent {
@@ -2018,23 +2111,33 @@ mod tests {
     }
 
     #[test]
-    fn main_graph_stays_live_only_even_when_range_changes() {
+    fn main_graph_uses_archive_for_long_ranges_and_live_for_8m() {
         let mut app = App::new();
         app.power_history = VecDeque::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        app.archive = persistence::ArchiveState {
+            raw_2s: VecDeque::from(vec![persistence::TierSample {
+                bucket_start_secs: 1_700,
+                sample_count: 2,
+                total_power_sum: 40.0,
+                processes: Vec::new(),
+                gap_before: false,
+            }]),
+            ..persistence::ArchiveState::default()
+        };
 
-        for range in [
-            GraphRange::Minutes8,
-            GraphRange::Minutes30,
-            GraphRange::Hours3,
-            GraphRange::Hours12,
-        ] {
-            app.graph_range = range;
-            let samples = app.main_graph_live_samples_for_width(2);
-            assert_eq!(
-                samples,
-                history_viewport_samples_deque(&app.power_history, 2)
-            );
-        }
+        app.graph_range = GraphRange::Minutes8;
+        assert_eq!(
+            app.main_graph_live_samples_for_width(2),
+            history_viewport_samples_deque(&app.power_history, 2)
+        );
+        assert!(app.main_graph_archive_samples_for_width(2).is_none());
+
+        app.graph_range = GraphRange::Minutes30;
+        let samples = app
+            .main_graph_archive_samples_for_width(3)
+            .expect("30m main graph should use aggregate archive samples");
+        assert_eq!(samples.len(), 6);
+        assert_eq!(samples[5], Some(20.0));
     }
 
     #[test]
@@ -2302,6 +2405,7 @@ mod tests {
                     }],
                 }],
                 archive: archive.clone(),
+                ui: None,
             },
             gap_millis: 99_999,
             hydrate_live: false,
@@ -2317,5 +2421,37 @@ mod tests {
         assert_eq!(app.archive, archive);
         assert!(app.loading);
         assert!(app.snapshot.rows.is_empty());
+    }
+
+    #[test]
+    fn loaded_session_cache_restores_persisted_ui_state() {
+        let mut app = App::new();
+
+        app.apply_loaded_session_cache(persistence::LoadedSessionCache {
+            cache: persistence::SessionCache {
+                saved_at_unix_millis: 1,
+                last_tick: 0,
+                live_power_history: Vec::new(),
+                live_snapshots: Vec::new(),
+                archive: persistence::ArchiveState::default(),
+                ui: Some(persistence::PersistedUiState {
+                    graph_yellow_start: 15.0,
+                    graph_orange_start: 35.0,
+                    graph_red_start: 70.0,
+                    graph_range: 2,
+                    show_graph: false,
+                    show_table: true,
+                }),
+            },
+            gap_millis: 99_999,
+            hydrate_live: false,
+        });
+
+        assert_eq!(app.settings.graph_heat.yellow_start, 15.0);
+        assert_eq!(app.settings.graph_heat.orange_start, 35.0);
+        assert_eq!(app.settings.graph_heat.red_start, 70.0);
+        assert_eq!(app.graph_range, GraphRange::Hours3);
+        assert!(!app.show_graph);
+        assert!(app.show_table);
     }
 }

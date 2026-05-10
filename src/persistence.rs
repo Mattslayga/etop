@@ -10,7 +10,8 @@ use std::{
 const CACHE_MAGIC: &[u8; 8] = b"ETOPCACH";
 const CACHE_VERSION_V2: u16 = 2;
 const CACHE_VERSION_V3: u16 = 3;
-const CACHE_VERSION: u16 = 4;
+const CACHE_VERSION_V4: u16 = 4;
+const CACHE_VERSION: u16 = 5;
 const CACHE_FILE_NAME: &str = "session-cache.v1.bin";
 const QUICK_HYDRATE_GAP_MULTIPLIER: u64 = 3;
 const LEGACY_ARCHIVE_PID: i32 = -1;
@@ -158,6 +159,17 @@ pub struct SessionCache {
     pub live_power_history: Vec<f64>,
     pub live_snapshots: Vec<LiveSnapshot>,
     pub archive: ArchiveState,
+    pub ui: Option<PersistedUiState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PersistedUiState {
+    pub graph_yellow_start: f64,
+    pub graph_orange_start: f64,
+    pub graph_red_start: f64,
+    pub graph_range: u8,
+    pub show_graph: bool,
+    pub show_table: bool,
 }
 
 impl SessionCache {
@@ -193,6 +205,33 @@ impl SessionCache {
         }
 
         self.archive.sanitize_power_data(max_reasonable_power);
+    }
+
+    pub fn sanitize_ui_state(&mut self) {
+        let Some(ui) = self.ui.as_mut() else {
+            return;
+        };
+
+        let valid_thresholds = [
+            ui.graph_yellow_start,
+            ui.graph_orange_start,
+            ui.graph_red_start,
+        ]
+        .iter()
+        .all(|value| value.is_finite() && *value >= 0.0)
+            && ui.graph_yellow_start < ui.graph_orange_start
+            && ui.graph_orange_start < ui.graph_red_start;
+        let valid_range = ui.graph_range <= 3;
+
+        if !valid_thresholds || !valid_range {
+            self.ui = None;
+            return;
+        }
+
+        if !ui.show_graph && !ui.show_table {
+            ui.show_graph = true;
+            ui.show_table = true;
+        }
     }
 }
 
@@ -273,6 +312,7 @@ fn load_session_cache_for_startup_from_path(
     let mut reader = BufReader::new(file);
     let mut cache = decode_session_cache(&mut reader)?;
     cache.sanitize_power_data(MAX_REASONABLE_PERSISTED_POWER);
+    cache.sanitize_ui_state();
     cache.enforce_bounds(live_limit);
 
     let gap_millis = unix_time_millis_now().saturating_sub(cache.saved_at_unix_millis);
@@ -289,6 +329,7 @@ fn save_session_cache_to_path(path: &Path, cache: &SessionCache) -> io::Result<(
     trim_vec_front(&mut bounded.live_power_history, MAX_LIVE_POWER_POINTS);
     trim_vec_front(&mut bounded.live_snapshots, MAX_LIVE_SNAPSHOTS);
     bounded.sanitize_power_data(MAX_REASONABLE_PERSISTED_POWER);
+    bounded.sanitize_ui_state();
     bounded.archive.enforce_bounds();
 
     if let Some(parent) = path.parent() {
@@ -480,6 +521,22 @@ fn encode_session_cache<W: Write>(cache: &SessionCache, writer: &mut W) -> io::R
     encode_tier(writer, &cache.archive.raw_2s)?;
     encode_tier(writer, &cache.archive.agg_10s)?;
     encode_tier(writer, &cache.archive.agg_60s)?;
+    encode_ui_state(writer, cache.ui.as_ref())?;
+
+    Ok(())
+}
+
+fn encode_ui_state<W: Write>(writer: &mut W, ui: Option<&PersistedUiState>) -> io::Result<()> {
+    write_bool(writer, ui.is_some())?;
+
+    if let Some(ui) = ui {
+        write_f64(writer, ui.graph_yellow_start)?;
+        write_f64(writer, ui.graph_orange_start)?;
+        write_f64(writer, ui.graph_red_start)?;
+        write_u8(writer, ui.graph_range)?;
+        write_bool(writer, ui.show_graph)?;
+        write_bool(writer, ui.show_table)?;
+    }
 
     Ok(())
 }
@@ -515,7 +572,11 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     }
 
     let version = read_u16(reader)?;
-    if version != CACHE_VERSION_V2 && version != CACHE_VERSION_V3 && version != CACHE_VERSION {
+    if version != CACHE_VERSION_V2
+        && version != CACHE_VERSION_V3
+        && version != CACHE_VERSION_V4
+        && version != CACHE_VERSION
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported cache version: {version}"),
@@ -561,13 +622,35 @@ fn decode_session_cache<R: Read>(reader: &mut R) -> io::Result<SessionCache> {
     };
     archive.enforce_bounds();
 
+    let ui = if version >= CACHE_VERSION {
+        decode_ui_state(reader)?
+    } else {
+        None
+    };
+
     Ok(SessionCache {
         saved_at_unix_millis,
         last_tick,
         live_power_history,
         live_snapshots,
         archive,
+        ui,
     })
+}
+
+fn decode_ui_state<R: Read>(reader: &mut R) -> io::Result<Option<PersistedUiState>> {
+    if !read_bool(reader)? {
+        return Ok(None);
+    }
+
+    Ok(Some(PersistedUiState {
+        graph_yellow_start: read_f64(reader)?,
+        graph_orange_start: read_f64(reader)?,
+        graph_red_start: read_f64(reader)?,
+        graph_range: read_u8(reader)?,
+        show_graph: read_bool(reader)?,
+        show_table: read_bool(reader)?,
+    }))
 }
 
 fn decode_tier<R: Read>(reader: &mut R, version: u16) -> io::Result<VecDeque<TierSample>> {
@@ -582,7 +665,7 @@ fn decode_tier<R: Read>(reader: &mut R, version: u16) -> io::Result<VecDeque<Tie
         let processes_len = read_len(reader, MAX_PROCESSES_PER_SAMPLE, "archived process samples")?;
         let mut processes = Vec::with_capacity(processes_len);
         match version {
-            CACHE_VERSION => {
+            CACHE_VERSION | CACHE_VERSION_V4 => {
                 for _ in 0..processes_len {
                     processes.push(ArchivedProcessPower {
                         pid: read_i32(reader)?,
@@ -677,6 +760,10 @@ fn write_bool<W: Write>(writer: &mut W, value: bool) -> io::Result<()> {
     writer.write_all(&[u8::from(value)])
 }
 
+fn write_u8<W: Write>(writer: &mut W, value: u8) -> io::Result<()> {
+    writer.write_all(&[value])
+}
+
 fn read_u16<R: Read>(reader: &mut R) -> io::Result<u16> {
     let mut buf = [0u8; 2];
     reader.read_exact(&mut buf)?;
@@ -718,6 +805,12 @@ fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
             format!("invalid bool value: {value}"),
         )),
     }
+}
+
+fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
 }
 
 #[cfg(test)]
@@ -861,6 +954,14 @@ mod tests {
                 },
             ],
             archive,
+            ui: Some(PersistedUiState {
+                graph_yellow_start: 20.0,
+                graph_orange_start: 40.0,
+                graph_red_start: 80.0,
+                graph_range: 2,
+                show_graph: true,
+                show_table: true,
+            }),
         };
 
         let mut bytes = Vec::new();
@@ -912,6 +1013,7 @@ mod tests {
                 last_sample_unix_secs: Some(108),
                 ..ArchiveState::default()
             },
+            ui: None,
         };
 
         let mut bytes = Vec::new();
@@ -977,6 +1079,7 @@ mod tests {
                 last_sample_unix_secs: Some(110),
                 ..ArchiveState::default()
             },
+            ui: None,
         };
 
         let mut bytes = Vec::new();
@@ -1193,6 +1296,7 @@ mod tests {
                 ]),
                 ..ArchiveState::default()
             },
+            ui: None,
         };
 
         cache.sanitize_power_data(MAX_REASONABLE_PERSISTED_POWER);

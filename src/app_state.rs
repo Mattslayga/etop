@@ -269,6 +269,25 @@ impl App {
         app
     }
 
+    fn persisted_graph_range(range: GraphRange) -> u8 {
+        match range {
+            GraphRange::Minutes8 => 0,
+            GraphRange::Minutes30 => 1,
+            GraphRange::Hours3 => 2,
+            GraphRange::Hours12 => 3,
+        }
+    }
+
+    fn graph_range_from_persisted(value: u8) -> Option<GraphRange> {
+        match value {
+            0 => Some(GraphRange::Minutes8),
+            1 => Some(GraphRange::Minutes30),
+            2 => Some(GraphRange::Hours3),
+            3 => Some(GraphRange::Hours12),
+            _ => None,
+        }
+    }
+
     pub(crate) fn process_active_filter(&self) -> &str {
         self.process_filter_input
             .as_deref()
@@ -442,6 +461,25 @@ impl App {
         } = loaded;
 
         self.archive = cache.archive;
+        if let Some(ui) = cache.ui {
+            let graph_heat = GraphHeatSettings {
+                yellow_start: ui.graph_yellow_start,
+                orange_start: ui.graph_orange_start,
+                red_start: ui.graph_red_start,
+            };
+            if graph_heat.validate().is_ok() {
+                self.settings.graph_heat = graph_heat;
+            }
+
+            if let Some(range) = Self::graph_range_from_persisted(ui.graph_range) {
+                self.graph_range = range;
+            }
+
+            if ui.show_graph || ui.show_table {
+                self.show_graph = ui.show_graph;
+                self.show_table = ui.show_table;
+            }
+        }
 
         if !hydrate_live {
             return;
@@ -488,6 +526,14 @@ impl App {
             live_power_history: self.power_history.iter().copied().collect(),
             live_snapshots: self.live_snapshot_history.iter().cloned().collect(),
             archive: self.archive.clone(),
+            ui: Some(persistence::PersistedUiState {
+                graph_yellow_start: self.settings.graph_heat.yellow_start,
+                graph_orange_start: self.settings.graph_heat.orange_start,
+                graph_red_start: self.settings.graph_heat.red_start,
+                graph_range: Self::persisted_graph_range(self.graph_range),
+                show_graph: self.show_graph,
+                show_table: self.show_table,
+            }),
         }
     }
 
@@ -497,6 +543,18 @@ impl App {
 
     pub(crate) fn main_graph_live_samples_for_width(&self, graph_width: usize) -> Vec<f64> {
         history_viewport_samples_deque(&self.power_history, graph_width)
+    }
+
+    pub(crate) fn main_graph_archive_samples_for_width(
+        &self,
+        graph_width: usize,
+    ) -> Option<Vec<Option<f64>>> {
+        let archive_range = self.graph_range.archive_range()?;
+        Some(archive_query::graph_samples_for_range(
+            &self.archive,
+            archive_range,
+            graph_width,
+        ))
     }
 
     pub(crate) fn pid_archive_samples_for_width(

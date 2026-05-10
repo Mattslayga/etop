@@ -42,13 +42,21 @@ Palette cues used in the TUI:
 - `d` clear the active filter
 - `p` pause/resume refresh
 - `s` cycle process sort
-- `r` cycle pinned history range
+- `r` cycle graph/history range
 - `Enter` pin/unpin process details
+- `1` show/hide graph
+- `2` show/hide process table
 - `m` open graph-threshold settings modal
   - `↑/↓` or `j/k` move fields
   - `Enter` edit/confirm field value
   - `m` apply settings and close
   - `Esc` cancel field edit or close without applying
+
+Process marker column:
+
+- `!` sustained offender
+- `^` current spike
+- `v` cooling after recent high power
 
 ## CLI
 
