@@ -30,6 +30,7 @@ pub const AGG_10S_BUCKET_SECS: u64 = 10;
 pub const AGG_10S_CAPACITY: usize = 1_080; // 3h @ 10s
 pub const AGG_60S_BUCKET_SECS: u64 = 60;
 pub const AGG_60S_CAPACITY: usize = 720; // 12h @ 60s
+const MAX_GRAPH_RANGE_INDEX: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveProcessSample {
@@ -221,7 +222,7 @@ impl SessionCache {
         .all(|value| value.is_finite() && *value >= 0.0)
             && ui.graph_yellow_start < ui.graph_orange_start
             && ui.graph_orange_start < ui.graph_red_start;
-        let valid_range = ui.graph_range <= 3;
+        let valid_range = ui.graph_range <= MAX_GRAPH_RANGE_INDEX;
 
         if !valid_thresholds || !valid_range {
             self.ui = None;
